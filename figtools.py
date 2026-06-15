@@ -25,6 +25,9 @@ FIG_LABELS = {"image", "chart", "table"}        # 切り出す対象（視覚的
 CAP_LABELS = {"figure_title"}                   # キャプション行
 DET_DPI = 150                                   # 検出用レンダリング解像度
 CROP_DPI = 300                                  # 切り出し解像度（原寸）
+EXPAND_PT = 0                                    # 外側へは広げない（広げると隣の見出し/キャプションを巻き込む）
+PAD_PX = 6                                       # 余白トリム後に残す均一マージン(px)。0で完全タイト
+TRIM_THRESH = 12                                # 余白トリムの白判定しきい値（これ未満の濃さ＝白＝余白）
 CAP_RE = re.compile(r"(?i)^\s*(fig(?:ure)?|table)\.?\s*(\d+)")   # 「Fig 3」始まりのみ＝本文/見出し誤検出を排除
 # PP-DocLayoutV2 のクラス（label_id→名前。OpenVINO版の後処理で使用）
 PP_LABELS = ["abstract", "algorithm", "aside_text", "chart", "content", "display_formula",
@@ -496,11 +499,21 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
 
-        def _crop(bb, fn, **extra):
+        def _crop(bb, fn, **extra):                                # 外側に少し広げて→余白を自動トリム＝枠ブレを安定化
+            from PIL import ImageChops
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
-            cpix[1].crop(tuple(round(v * cs) for v in bb)).save(os.path.join(out_dir, fn), quality=90)
+            full = cpix[1]; W, H = full.size
+            m = round(EXPAND_PT * cs)
+            x0, y0, x1, y1 = (round(v * cs) for v in bb)
+            sub = full.crop((max(0, x0 - m), max(0, y0 - m), min(W, x1 + m), min(H, y1 + m)))
+            diff = ImageChops.difference(sub.convert("L"), Image.new("L", sub.size, 255))
+            bx = diff.point(lambda p: 255 if p > TRIM_THRESH else 0).getbbox()   # 非白の外接矩形＝実際の図の輪郭
+            if bx:
+                sub = sub.crop((max(0, bx[0] - PAD_PX), max(0, bx[1] - PAD_PX),
+                                min(sub.width, bx[2] + PAD_PX), min(sub.height, bx[3] + PAD_PX)))
+            sub.save(os.path.join(out_dir, fn), quality=90)
             manifest.append({"file": fn, "page": pno + 1, "bbox_pt": [round(x, 1) for x in bb], **extra})
 
         if top:                                                    # ── 位置基準（領域ごと）
