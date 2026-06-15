@@ -13,7 +13,7 @@
 Built on MinerU (https://github.com/opendatalab/MinerU) + OpenVINO。詳細は README.md。
 """
 import sys, os, json, io, re, fitz
-from collections import defaultdict
+from collections import defaultdict, deque
 
 try:                                            # Windows コンソール(cp932)でも µ 等を出せるように
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -25,9 +25,10 @@ FIG_LABELS = {"image", "chart", "table"}        # 切り出す対象（視覚的
 CAP_LABELS = {"figure_title"}                   # キャプション行
 DET_DPI = 150                                   # 検出用レンダリング解像度
 CROP_DPI = 300                                  # 切り出し解像度（原寸）
-EXPAND_PT = 0                                    # 外側へは広げない（広げると隣の見出し/キャプションを巻き込む）
+EXPAND_PT = 3.0                                  # 検出枠の数px内入りを救う微小拡張（隣図の孤立線は_trim_boxで除去）
 PAD_PX = 6                                       # 余白トリム後に残す均一マージン(px)。0で完全タイト
 TRIM_THRESH = 12                                # 余白トリムの白判定しきい値（これ未満の濃さ＝白＝余白）
+EDGE_LINE_FRAC = 0.60                           # 隣図の枠線扱いする最小投影長（文字ストローク誤削除を避ける）
 CAP_RE = re.compile(r"(?i)^\s*(fig(?:ure)?|table)\.?\s*(\d+)")   # 「Fig 3」始まりのみ＝本文/見出し誤検出を排除
 # PP-DocLayoutV2 のクラス（label_id→名前。OpenVINO版の後処理で使用）
 PP_LABELS = ["abstract", "algorithm", "aside_text", "chart", "content", "display_formula",
@@ -432,21 +433,30 @@ def _panel_of(region_bb, panels):
     return best
 
 
-def _assign_bands(region_bbs, caps):
+def _assign_bands(region_bbs, caps, page_width=None):
     """各図領域を「同カラムで直下にある最も近いキャプション」の Fig 番号に割当てる（union しない）。
     多パネル図は同じ番号を共有（領域ごとに別ファイルで出す）。番号はキャプション側が持つので、
     そのページが図5始まりでも実番号が付く。返り値 {region_index: num}。"""
     cs = sorted(caps, key=lambda c: c[0][1])
+    single_caption_page = page_width is not None and len(cs) == 1
+    row_unique = []
+    for cbb, _l, _num in cs:
+        cy0 = cbb[1]
+        row_unique.append(sum(1 for obb, _ol, _on in cs if abs(obb[1] - cy0) < 50) == 1)
     assign = {}
     for i, (fx0, fy0, fx1, fy1) in enumerate(region_bbs):
         fw = max(1.0, fx1 - fx0)
         best, bestgap = None, 1e9
-        for cbb, _l, num in cs:
+        for ci, (cbb, _l, num) in enumerate(cs):
             cx0, cy0, cx1, cy1 = cbb
+            if single_caption_page:
+                cx0, cx1 = 0.0, page_width
             ov = min(fx1, cx1) - max(fx0, cx0)
-            if ov <= 0.2 * min(fw, cx1 - cx0):          # 同カラム（横が重なる）だけ
-                continue
             gap = cy0 - fy1                             # 図の下端→キャプション上端
+            same_col = ov > 0.2 * min(fw, cx1 - cx0)
+            same_row_caption = row_unique[ci] and -8 <= gap <= 24
+            if not same_col and not same_row_caption:
+                continue
             if -8 <= gap < bestgap:                     # 直下で最も近いキャプション＝その図の番号
                 best, bestgap = num, gap
         if best is not None and bestgap < 350:          # 遠すぎる対応は捨てる
@@ -458,49 +468,329 @@ def _union(a, b):
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
-def _trim_box(img):
-    """img 内の切出範囲 (x0,y0,x1,y1) を返す。外周の余白に加え、**本体から隙間を空けて孤立した
-    細い縁(隣の図の枠のはみ込み等)も除去**（図自身の枠＝本体に接する線は残す）。
-    投影プロファイルを『高さ/幅の一定割合以上のインク』で2値化して判定（薄いノイズ列を隙間とみなす）。"""
-    import numpy as np
-    a = np.asarray(img.convert("L"))
-    H, W = a.shape
-    ink = a < (255 - TRIM_THRESH)
-    colc, rowc = ink.sum(axis=0), ink.sum(axis=1)
+def _bool_run_count(mask):
+    total = 0
+    i = 0
+    n = len(mask)
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        total += 1
+        while i < n and mask[i]:
+            i += 1
+    return total
 
-    def bnds(cnt, n, span):
-        nz = np.flatnonzero(cnt)                       # 何かインクがある範囲（外周余白を除く）
+
+def _bool_run_bounds(mask, offset=0):
+    runs = []
+    i = 0
+    n = len(mask)
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and mask[i]:
+            i += 1
+        runs.append((offset + start, offset + i))
+    return runs
+
+
+def _trim_box(img, ignore_mask=None, return_edges=False):
+    """Return the content box, trimming white margin and detached neighbor-frame lines.
+
+    The ordinary white trim uses the ink projection. A second pass only peels off
+    long, thin edge strokes when they are detached from the figure body, so table
+    borders, axes, and edge labels stay intact.
+    """
+    import numpy as np
+    gray = np.asarray(img.convert("L"))
+    H, W = gray.shape
+    ink = gray < (255 - TRIM_THRESH)
+    dark = gray < 80
+    ignore = None
+    if ignore_mask is not None:
+        ignore = np.asarray(ignore_mask, dtype=bool)
+        if ignore.shape == ink.shape:
+            ink &= ~ignore
+            dark &= ~ignore
+        else:
+            ignore = None
+    colc, rowc = ink.sum(axis=0), ink.sum(axis=1)
+    dark_colc, dark_rowc = dark.sum(axis=0), dark.sum(axis=1)
+
+    def axis_size(axis):
+        return (W, H) if axis == "x" else (H, W)
+
+    def axis_dark_counts(axis):
+        return dark_colc if axis == "x" else dark_rowc
+
+    def edge_component_is_long_line(axis, start, end):
+        # Flood fill is only used after projection tests say "maybe a frame".
+        if axis == "x":
+            seeds = np.argwhere(ink[:, start:end])
+            if seeds.size == 0:
+                return False
+            seeds[:, 1] += start
+        else:
+            seeds = np.argwhere(ink[start:end, :])
+            if seeds.size == 0:
+                return False
+            seeds[:, 0] += start
+
+        seen = np.zeros_like(ink, dtype=bool)
+        q = deque((int(y), int(x)) for y, x in seeds)
+        miny, maxy, minx, maxx = H, -1, W, -1
+        while q:
+            y, x = q.pop()
+            if y < 0 or y >= H or x < 0 or x >= W or seen[y, x] or not ink[y, x]:
+                continue
+            seen[y, x] = True
+            miny, maxy = min(miny, y), max(maxy, y)
+            minx, maxx = min(minx, x), max(maxx, x)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy or dx:
+                        q.append((y + dy, x + dx))
+        if maxy < miny:
+            return False
+        bw, bh = maxx - minx + 1, maxy - miny + 1
+        axis_len, _span = axis_size(axis)
+        strip = max(3, int(axis_len * 0.06))
+        return (bw <= strip and bh >= EDGE_LINE_FRAC * H) if axis == "x" else \
+               (bh <= strip and bw >= EDGE_LINE_FRAC * W)
+
+    def has_body_connections(axis, start, end, side):
+        depth = 4
+        if axis == "x":
+            c0, c1 = (end, min(W, end + depth)) if side == "lo" else (max(0, start - depth), start)
+            if c0 >= c1:
+                return False
+            inner_strip = ink[:, c0:c1]
+            dark_cand = dark[:, start:end].any(axis=1)
+            dark_inner = dark[:, c0:c1].any(axis=1)
+        else:
+            r0, r1 = (end, min(H, end + depth)) if side == "lo" else (max(0, start - depth), start)
+            if r0 >= r1:
+                return False
+            inner_strip = ink[r0:r1, :]
+            dark_cand = dark[start:end, :].any(axis=0)
+            dark_inner = dark[r0:r1, :].any(axis=0)
+        filled_body = int(inner_strip.sum()) >= 0.5 * inner_strip.size
+        return filled_body or _bool_run_count(dark_cand & dark_inner) >= 2
+
+    def peel_edge_lines(lo, hi, axis, side):
+        """Peel detached long edge lines, but stop at connected axes/table borders."""
+        axis_len, span = axis_size(axis)
+        counts = axis_dark_counts(axis)
+        cur_lo, cur_hi = lo, hi
+        changed = False
+
+        def outside_sparse(run, base_lo, base_hi):
+            start, end = run
+            outside = int(counts[base_lo:start].sum()) if side == "lo" else int(counts[end:base_hi].sum())
+            dist = max(1, (start - base_lo) if side == "lo" else (base_hi - end))
+            return outside < max(20, int(0.005 * span * dist))
+
+        while cur_hi - cur_lo > 4:
+            scan = min(cur_hi - cur_lo, max(36, min(96, int(axis_len * 0.08))))
+            if side == "lo":
+                s0, s1 = cur_lo, min(cur_hi, cur_lo + scan)
+            else:
+                s0, s1 = max(cur_lo, cur_hi - scan), cur_hi
+            runs = _bool_run_bounds(counts[s0:s1] >= EDGE_LINE_FRAC * span, s0)
+            if not runs:
+                break
+            start, end = runs[0] if side == "lo" else runs[-1]
+            connected = has_body_connections(axis, start, end, side)
+            if connected:
+                if outside_sparse((start, end), cur_lo, cur_hi):
+                    if side == "lo":
+                        cur_lo = start
+                    else:
+                        cur_hi = end
+                    changed = True
+                break
+            if side == "lo":
+                cur_lo = end
+            else:
+                cur_hi = start
+            changed = True
+        return (cur_lo if side == "lo" else cur_hi), changed
+
+    def trim_axis(counts, axis):
+        axis_len, span = axis_size(axis)
+        nz = np.flatnonzero(counts)
         if nz.size == 0:
-            return 0, n
+            return 0, axis_len, False, False
         lo, hi = int(nz[0]), int(nz[-1]) + 1
-        sub = cnt > max(2, 0.05 * span)                # 「実質インク」(細線/フル線は満たす・薄い隙間は満たさない)
-        strip = max(3, int(n * 0.06))                  # 「細い縁」とみなす最大幅
-        j = lo                                         # 先頭：実質インクの細い塊＋隙間なら捨てる
-        while j < hi and sub[j]:
+        cut_lo = cut_hi = False
+        substantive = counts > max(2, 0.05 * span)
+        strip = max(3, int(axis_len * 0.06))
+        inner_win = max(16, PAD_PX * 4)
+
+        def has_near_inner_line(start, end, side):
+            if side == "lo":
+                c0, c1 = end, min(hi, end + inner_win)
+            else:
+                c0, c1 = max(lo, start - inner_win), start
+            return c0 < c1 and counts[c0:c1].max(initial=0) >= EDGE_LINE_FRAC * span
+
+        def is_frame_line(start, end, side):
+            return (1 <= (end - start) <= strip
+                    and counts[start:end].max(initial=0) >= EDGE_LINE_FRAC * span
+                    and (edge_component_is_long_line(axis, start, end)
+                         or has_near_inner_line(start, end, side)
+                         or not has_body_connections(axis, start, end, side)))
+
+        j = lo
+        while j < hi and substantive[j]:
             j += 1
         k = j
-        while k < hi and not sub[k]:
+        while k < hi and not substantive[k]:
             k += 1
-        if 1 <= (j - lo) <= strip and (k - j) >= 4 and k < hi:
-            lo = k
-        j = hi - 1                                     # 末尾：同様
-        while j >= lo and sub[j]:
+        if is_frame_line(lo, j, "lo") and (k - j) >= 2 and k < hi:
+            lo = j
+            cut_lo = True
+
+        j = hi - 1
+        while j >= lo and substantive[j]:
             j -= 1
         k = j
-        while k >= lo and not sub[k]:
+        while k >= lo and not substantive[k]:
             k -= 1
-        if 1 <= (hi - 1 - j) <= strip and (j - k) >= 4 and (k + 1) > lo:
-            hi = k + 1
-        return lo, hi
+        if is_frame_line(j + 1, hi, "hi") and (j - k) >= 2 and (k + 1) > lo:
+            hi = j + 1
+            cut_hi = True
 
-    x0, x1 = bnds(colc, W, H)
-    y0, y1 = bnds(rowc, H, W)
+        nlo, snapped = peel_edge_lines(lo, hi, axis, "lo")
+        if snapped:
+            lo = nlo
+            cut_lo = True
+        nhi, snapped = peel_edge_lines(lo, hi, axis, "hi")
+        if snapped:
+            hi = nhi
+            cut_hi = True
+        return lo, hi, cut_lo, cut_hi
+
+    x0, x1, cut_l, cut_r = trim_axis(colc, "x")
+    y0, y1, cut_t, cut_b = trim_axis(rowc, "y")
     if x1 - x0 < 4 or y1 - y0 < 4:
-        return (0, 0, W, H)
-    return (x0, y0, x1, y1)
+        box = (0, 0, W, H)
+        edges = (False, False, False, False)
+    else:
+        box = (x0, y0, x1, y1)
+        edges = (cut_l, cut_t, cut_r, cut_b)
+    return (box, edges) if return_edges else box
 
 
-def _whole_figures(region_bbs, assign, caps):
+def _caption_gap_bottom_px(gray, left, right, height, cbb, scale):
+    """Caption直前の白い水平帯の下端(px)。テキストbboxではなく描画結果で決める。"""
+    import numpy as np
+    _cx0, cy0, _cx1, _cy1 = cbb
+    y0 = max(0, round((cy0 - 5.0) * scale))
+    y1 = min(height, round((cy0 + 2.0) * scale))
+    if right <= left or y1 <= y0:
+        return round(cy0 * scale)
+    rows = (gray[y0:y1, left:right] < 245).sum(axis=1)
+    max_ink = max(5, int((right - left) * 0.001))
+    white_rows = np.flatnonzero(rows <= max_ink)
+    return y0 + int(white_rows[-1]) + 1 if white_rows.size else round(cy0 * scale)
+
+
+def _caption_guard_bottom_px(full_img, gray_ref, crop_box, fig_bb, cap_bbs, scale):
+    """Return a bottom crop guard at the white band immediately above the caption."""
+    if not cap_bbs:
+        return None
+    left, _top, right, _bottom = crop_box
+    _width, height = full_img.size
+    bx0, by0, bx1, by1 = fig_bb
+    fig_w = max(1.0, bx1 - bx0)
+    guard = None
+
+    for cbb in cap_bbs:
+        cx0, cy0, cx1, _cy1 = cbb
+        cap_w = max(1.0, cx1 - cx0)
+        overlap = min(bx1, cx1) - max(bx0, cx0)
+        if overlap <= 0.2 * min(fig_w, cap_w):
+            continue
+        if cy0 + 2.0 <= by0 or cy0 - 5.0 > by1 + EXPAND_PT + 2.0:
+            continue
+        if gray_ref[0] is None:
+            import numpy as np
+            gray_ref[0] = np.asarray(full_img.convert("L"))
+        gap_bottom = _caption_gap_bottom_px(gray_ref[0], left, right, height, cbb, scale)
+        gap_bottom_pt = gap_bottom / scale
+        if by0 < gap_bottom_pt <= by1 + EXPAND_PT + 2.0:
+            candidate = max(crop_box[1] + 1, gap_bottom)
+            guard = candidate if guard is None else min(guard, candidate)
+    return guard
+
+
+def _rect_overlap(a, b):
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+
+
+def _mask_rect(mask, rect, crop_box, scale, pad=1):
+    left, top, _right, _bottom = crop_box
+    H, W = mask.shape
+    x0 = max(0, round(rect[0] * scale) - left - pad)
+    y0 = max(0, round(rect[1] * scale) - top - pad)
+    x1 = min(W, round(rect[2] * scale) - left + pad)
+    y1 = min(H, round(rect[3] * scale) - top + pad)
+    if x1 > x0 and y1 > y0:
+        mask[y0:y1, x0:x1] = True
+
+
+def _trim_ignore_mask(shape, crop_box_px, fig_bb, text_lines, drawing_bbs, scale):
+    """Mask PDF page furniture for trim decisions only; never alters saved pixels."""
+    import numpy as np
+    H, W = shape
+    mask = np.zeros((H, W), dtype=bool)
+    left, top, right, bottom = crop_box_px
+    crop_pt = (left / scale, top / scale, right / scale, bottom / scale)
+    fx0, fy0, fx1, fy1 = fig_bb
+    fig_w, fig_h = max(1.0, fx1 - fx0), max(1.0, fy1 - fy0)
+
+    def outside_figure(rect, tol=0.6):
+        rx0, ry0, rx1, ry1 = rect
+        cx, cy = (rx0 + rx1) / 2.0, (ry0 + ry1) / 2.0
+        return not (fx0 - tol <= cx <= fx1 + tol and fy0 - tol <= cy <= fy1 + tol)
+
+    for _txt, rect in text_lines:
+        if not CAP_RE.match(_txt):
+            continue
+        if _rect_overlap(rect, crop_pt) <= 0 or not outside_figure(rect):
+            continue
+        _mask_rect(mask, rect, crop_box_px, scale, pad=2)
+
+    fig_area = fig_w * fig_h
+    for item in drawing_bbs:
+        rect, fill, color, width = item
+        if _rect_overlap(rect, crop_pt) <= 0:
+            continue
+        rx0, ry0, rx1, ry1 = rect
+        rw, rh = rx1 - rx0, ry1 - ry0
+        area = max(0.1, rw * rh)
+        overlap_ratio = _rect_overlap(rect, fig_bb) / min(area, fig_area)
+        if overlap_ratio > 0.20:
+            continue
+        cy = (ry0 + ry1) / 2.0
+        outside_vert = cy < fy0 or cy > fy1
+        dark_fill = fill is not None and sum(fill[:3]) / 3.0 < 0.90
+        thin_rule = fill is None and (width or 0.0) <= 1.5 and rh <= 3.0
+        long_hline = rw >= 0.35 * fig_w and thin_rule
+        long_bar = rw >= 0.35 * fig_w and rh <= max(14.0, 0.08 * fig_h) and dark_fill
+        if outside_vert and (long_hline or long_bar):
+            _mask_rect(mask, rect, crop_box_px, scale, pad=2)
+    if W and H:
+        mask[mask.sum(axis=1) >= 0.70 * W, :] = True
+        mask[:, mask.sum(axis=0) >= 0.70 * H] = True
+    return mask
+
+
+def _whole_figures(region_bbs, assign):
     """Fig.N ごとに **図本体**の bbox を返す {num: bbox}＝所属領域(image/chart/table)の外接矩形。
     矩形なので領域の範囲内にある図中テキスト(プロセス説明文・パネル記号等)は入るが、
     **キャプション行『Fig.N: …』は union に含めない**ので巻き込まない（図だけ欲しい用途）。"""
@@ -512,7 +802,7 @@ def _whole_figures(region_bbs, assign, caps):
 
 def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False):
     """論文PDFから図を切り出す。**既定＝図ごとに一括（全パネル＋間のテキスト込みで1枚）**。
-      （既定 None,None,False）… 各 Fig.N を1枚に（所属領域∪キャプションの外接矩形）。番号不明領域は x##。
+      （既定 None,None,False）… 各 Fig.N を1枚に（所属領域の外接矩形）。番号不明領域は x##。
       panels=True … a/b/c… パネル単位に分割（各領域を個別切出・パネル記号で命名）。
       figs=[1,2]  … その Fig 番号だけ（一括/分割どちらにも効く）。Fig5 始まりページでも実番号で当たる。
       top=2       … 各ページ上から2領域（位置基準・密ページ用フォールバック）。
@@ -532,26 +822,67 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         preds = m.predict(img)
         caps = _text_captions(page)                                # テキスト層からFig.N行を直接(検出漏れに強い)
+        text_lines = _line_boxes(page)
         plabels = _panel_labels(page)                              # (a)(b)… パネル記号
         regions = [d for d in preds if d["label"] in FIG_LABELS]
         regions.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))   # 上→下, 左→右
         if not regions:
             continue
         region_bbs = [tuple(x * s for x in d["bbox"]) for d in regions]
-        assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号
+        assign = _assign_bands(region_bbs, caps, page.rect.width)   # 各領域→所属Fig番号
+        cap_map = {}
+        for cbb, _line, cnum in caps:
+            cap_map.setdefault(cnum, []).append(cbb)
+        drawing_bbs = []
+        try:
+            for dr in page.get_drawings():
+                r = dr.get("rect")
+                if r and not r.is_empty:
+                    drawing_bbs.append(((r.x0, r.y0, r.x1, r.y1),
+                                        dr.get("fill"), dr.get("color"), dr.get("width")))
+        except Exception:
+            pass
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
+        cap_gray = [None]                                          # caption実インク位置検出用
 
-        def _crop(bb, fn, **extra):                                # 検出枠→余白&孤立縁トリム→均一マージン
+        def _crop(bb, fn, cap_bbs=(), **extra):                    # 検出枠→余白&孤立縁トリム→均一マージン
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
             full = cpix[1]; W, H = full.size
             m = round(EXPAND_PT * cs)
             x0, y0, x1, y1 = (round(v * cs) for v in bb)
-            sub = full.crop((max(0, x0 - m), max(0, y0 - m), min(W, x1 + m), min(H, y1 + m)))
-            tx0, ty0, tx1, ty1 = _trim_box(sub)                    # 余白＋隣図の縁はみ込みを除去
-            sub = sub.crop((max(0, tx0 - PAD_PX), max(0, ty0 - PAD_PX),
-                            min(sub.width, tx1 + PAD_PX), min(sub.height, ty1 + PAD_PX)))
+            left, top = max(0, x0 - m), max(0, y0)
+            right, bottom = min(W, x1 + m), min(H, y1 + m)
+            guard_bottom = _caption_guard_bottom_px(
+                full, cap_gray, (left, top, right, bottom), bb, cap_bbs, cs)
+            if guard_bottom is not None:
+                bottom = min(H, guard_bottom)
+            sub = full.crop((left, top, right, bottom))
+            ignore = _trim_ignore_mask(sub.size[::-1], (left, top, right, bottom), bb, text_lines, drawing_bbs, cs)
+            (tx0, ty0, tx1, ty1), edges = _trim_box(sub, ignore_mask=ignore, return_edges=True)
+            cut_l, cut_t, cut_r, cut_b = edges
+            if tx0 > 0 and ignore[:, max(0, tx0 - PAD_PX):tx0].any():
+                cut_l = True
+            if ty0 > 0 and ignore[max(0, ty0 - PAD_PX):ty0, :].any():
+                cut_t = True
+            if tx1 < sub.width and ignore[:, tx1:min(sub.width, tx1 + PAD_PX)].any():
+                cut_r = True
+            if ty1 < sub.height and ignore[ty1:min(sub.height, ty1 + PAD_PX), :].any():
+                cut_b = True
+            sx0 = tx0 if cut_l else max(0, tx0 - PAD_PX)
+            sy0 = ty0 if cut_t else max(0, ty0 - PAD_PX)
+            sx1 = tx1 if cut_r else min(sub.width, tx1 + PAD_PX)
+            sy1 = ty1 if cut_b else min(sub.height, ty1 + PAD_PX)
+            if guard_bottom is not None:
+                sy1 = sub.height                              # キャプション直前までの白い隙間は保持
+            lp, tp = max(0, PAD_PX - (tx0 - sx0)), max(0, PAD_PX - (ty0 - sy0))
+            rp, bp = max(0, PAD_PX - (sx1 - tx1)), max(0, PAD_PX - (sy1 - ty1))
+            sub = sub.crop((sx0, sy0, sx1, sy1))
+            if lp or tp or rp or bp:
+                canvas = Image.new(sub.mode, (sub.width + lp + rp, sub.height + tp + bp), "white")
+                canvas.paste(sub, (lp, tp))
+                sub = canvas
             sub.save(os.path.join(out_dir, fn), quality=90)
             manifest.append({"file": fn, "page": pno + 1, "bbox_pt": [round(x, 1) for x in bb], **extra})
 
@@ -574,20 +905,26 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                 seen[base] = seen.get(base, 0) + 1
                 tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
                 _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
+                      cap_bbs=cap_map.get(num, ()) if num is not None else (),
                       fig=(f"Fig{num}" if num is not None else None), label=d["label"])
             continue
         # ── 既定：図ごとに一括（全体）
-        wholes = _whole_figures(region_bbs, assign, caps)
+        wholes = _whole_figures(region_bbs, assign)
         for num in sorted(wholes):
             if want is not None and num not in want:
                 continue
-            _crop(wholes[num], f"fig_p{pno+1:02d}_Fig{num}.jpg", fig=f"Fig{num}", label="figure")
+            _crop(wholes[num], f"fig_p{pno+1:02d}_Fig{num}.jpg",
+                  cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}", label="figure")
         if want is None:                                           # 番号に属さない領域は個別フォールバック
             xn = 0
             for i, d in enumerate(regions):
                 if i not in assign:
+                    bb = region_bbs[i]
+                    area = max(1.0, (bb[2] - bb[0]) * (bb[3] - bb[1]))
+                    if any(_rect_overlap(bb, wbb) >= 0.80 * area for wbb in wholes.values()):
+                        continue
                     xn += 1
-                    _crop(region_bbs[i], f"fig_p{pno+1:02d}_x{xn:02d}_{d['label']}.jpg",
+                    _crop(bb, f"fig_p{pno+1:02d}_x{xn:02d}_{d['label']}.jpg",
                           fig=None, label=d["label"])
     json.dump(manifest, open(os.path.join(out_dir, "figures.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
