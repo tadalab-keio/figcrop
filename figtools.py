@@ -458,6 +458,48 @@ def _union(a, b):
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
+def _trim_box(img):
+    """img 内の切出範囲 (x0,y0,x1,y1) を返す。外周の余白に加え、**本体から隙間を空けて孤立した
+    細い縁(隣の図の枠のはみ込み等)も除去**（図自身の枠＝本体に接する線は残す）。
+    投影プロファイルを『高さ/幅の一定割合以上のインク』で2値化して判定（薄いノイズ列を隙間とみなす）。"""
+    import numpy as np
+    a = np.asarray(img.convert("L"))
+    H, W = a.shape
+    ink = a < (255 - TRIM_THRESH)
+    colc, rowc = ink.sum(axis=0), ink.sum(axis=1)
+
+    def bnds(cnt, n, span):
+        nz = np.flatnonzero(cnt)                       # 何かインクがある範囲（外周余白を除く）
+        if nz.size == 0:
+            return 0, n
+        lo, hi = int(nz[0]), int(nz[-1]) + 1
+        sub = cnt > max(2, 0.05 * span)                # 「実質インク」(細線/フル線は満たす・薄い隙間は満たさない)
+        strip = max(3, int(n * 0.06))                  # 「細い縁」とみなす最大幅
+        j = lo                                         # 先頭：実質インクの細い塊＋隙間なら捨てる
+        while j < hi and sub[j]:
+            j += 1
+        k = j
+        while k < hi and not sub[k]:
+            k += 1
+        if 1 <= (j - lo) <= strip and (k - j) >= 4 and k < hi:
+            lo = k
+        j = hi - 1                                     # 末尾：同様
+        while j >= lo and sub[j]:
+            j -= 1
+        k = j
+        while k >= lo and not sub[k]:
+            k -= 1
+        if 1 <= (hi - 1 - j) <= strip and (j - k) >= 4 and (k + 1) > lo:
+            hi = k + 1
+        return lo, hi
+
+    x0, x1 = bnds(colc, W, H)
+    y0, y1 = bnds(rowc, H, W)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return (0, 0, W, H)
+    return (x0, y0, x1, y1)
+
+
 def _whole_figures(region_bbs, assign, caps):
     """Fig.N ごとに **図本体**の bbox を返す {num: bbox}＝所属領域(image/chart/table)の外接矩形。
     矩形なので領域の範囲内にある図中テキスト(プロセス説明文・パネル記号等)は入るが、
@@ -499,8 +541,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
 
-        def _crop(bb, fn, **extra):                                # 外側に少し広げて→余白を自動トリム＝枠ブレを安定化
-            from PIL import ImageChops
+        def _crop(bb, fn, **extra):                                # 検出枠→余白&孤立縁トリム→均一マージン
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
@@ -508,11 +549,9 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
             m = round(EXPAND_PT * cs)
             x0, y0, x1, y1 = (round(v * cs) for v in bb)
             sub = full.crop((max(0, x0 - m), max(0, y0 - m), min(W, x1 + m), min(H, y1 + m)))
-            diff = ImageChops.difference(sub.convert("L"), Image.new("L", sub.size, 255))
-            bx = diff.point(lambda p: 255 if p > TRIM_THRESH else 0).getbbox()   # 非白の外接矩形＝実際の図の輪郭
-            if bx:
-                sub = sub.crop((max(0, bx[0] - PAD_PX), max(0, bx[1] - PAD_PX),
-                                min(sub.width, bx[2] + PAD_PX), min(sub.height, bx[3] + PAD_PX)))
+            tx0, ty0, tx1, ty1 = _trim_box(sub)                    # 余白＋隣図の縁はみ込みを除去
+            sub = sub.crop((max(0, tx0 - PAD_PX), max(0, ty0 - PAD_PX),
+                            min(sub.width, tx1 + PAD_PX), min(sub.height, ty1 + PAD_PX)))
             sub.save(os.path.join(out_dir, fn), quality=90)
             manifest.append({"file": fn, "page": pno + 1, "bbox_pt": [round(x, 1) for x in bb], **extra})
 
