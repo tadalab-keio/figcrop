@@ -451,13 +451,29 @@ def _assign_bands(region_bbs, caps):
     return assign
 
 
-def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
-    """**領域ごと**に切り出す（モデル検出のまま＝クリーン。union はしない）。各領域に所属 Fig 番号を付与:
-      figs=[1,2] … Fig.1,2 に属する図/パネルを（個別ファイルで）全部切る。Fig5 始まりページでも実番号で当たる
-      top=2      … 各ページ上から2領域だけ（位置基準・密ページ用フォールバック）
-      両方 None  … 全図（各領域 Fig{n}_… か、番号不明は x## で命名）。
-    番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（_assign_bands）。
-    超高密度ページ(IEDM級)は図とキャプションが入り組み番号付けが不正確になり得る（その時は top=）。"""
+def _union(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _whole_figures(region_bbs, assign, caps):
+    """Fig.N ごとに **図全体**の bbox を返す {num: bbox}＝所属領域 ∪ キャプション の外接矩形。
+    矩形なので間の本文(プロセス説明文等)も含まれる＝『本の通り』の一括切出。"""
+    out = {}
+    for i, num in assign.items():                    # 所属領域を union
+        out[num] = region_bbs[i] if num not in out else _union(out[num], region_bbs[i])
+    for cbb, _l, num in caps:                          # キャプションも含める（間のテキストを取り込む）
+        if num in out:
+            out[num] = _union(out[num], cbb)
+    return out
+
+
+def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False):
+    """論文PDFから図を切り出す。**既定＝図ごとに一括（全パネル＋間のテキスト込みで1枚）**。
+      （既定 None,None,False）… 各 Fig.N を1枚に（所属領域∪キャプションの外接矩形）。番号不明領域は x##。
+      panels=True … a/b/c… パネル単位に分割（各領域を個別切出・パネル記号で命名）。
+      figs=[1,2]  … その Fig 番号だけ（一括/分割どちらにも効く）。Fig5 始まりページでも実番号で当たる。
+      top=2       … 各ページ上から2領域（位置基準・密ページ用フォールバック）。
+    番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（PDFテキスト層・MinerU非依存）。"""
     import fitz
     m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
     os.makedirs(out_dir, exist_ok=True)
@@ -473,45 +489,56 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         preds = m.predict(img)
         caps = _text_captions(page)                                # テキスト層からFig.N行を直接(検出漏れに強い)
-        panels = _panel_labels(page)                               # (a)(b)… パネル記号
+        plabels = _panel_labels(page)                              # (a)(b)… パネル記号
         regions = [d for d in preds if d["label"] in FIG_LABELS]
         regions.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))   # 上→下, 左→右
         if not regions:
             continue
         region_bbs = [tuple(x * s for x in d["bbox"]) for d in regions]
+        assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
 
-        def _crop(bb, fn):                                         # 必要時に1回だけ高dpi描画→PIL切出
+        def _crop(bb, fn, **extra):
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
             cpix[1].crop(tuple(round(v * cs) for v in bb)).save(os.path.join(out_dir, fn), quality=90)
+            manifest.append({"file": fn, "page": pno + 1, "bbox_pt": [round(x, 1) for x in bb], **extra})
 
-        assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号（union しない）
-        if top:
-            regions, region_bbs = regions[:top], region_bbs[:top]  # 位置で上から top 個
-        seen, xn = {}, 0
-        for i, d in enumerate(regions):
-            num = assign.get(i)
-            if top is None and want is not None and num not in want:   # figs指定＝その番号の図(全パネル)
-                continue
-            if top is not None:                          # 位置基準＝順位で命名（番号は使わない）
-                xn += 1
-                tag = f"top{xn:02d}_{d['label']}"
-            elif num is not None:                        # 実Fig番号＋パネル記号(a/b/…)。記号無しはラベル
-                pl = _panel_of(region_bbs[i], panels)
-                base = f"Fig{num}_{pl}" if pl else f"Fig{num}_{d['label']}"
-                seen[base] = seen.get(base, 0) + 1       # 同名は -2,-3… で衝突回避
-                tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
-            else:
-                if want is not None:                     # figs指定時、番号不明領域はスキップ
+        if top:                                                    # ── 位置基準（領域ごと）
+            for k, d in enumerate(regions[:top], 1):
+                _crop(region_bbs[k - 1], f"fig_p{pno+1:02d}_top{k:02d}_{d['label']}.jpg",
+                      fig=None, label=d["label"])
+            continue
+        if panels:                                                 # ── a/b/c パネル分割（領域ごと）
+            seen = {}
+            for i, d in enumerate(regions):
+                num = assign.get(i)
+                if (want is not None and num not in want) or (num is None and want is not None):
                     continue
-                xn += 1
-                tag = f"x{xn:02d}_{d['label']}"          # キャプション割当無し＝連番フォールバック
-            fn = f"fig_p{pno+1:02d}_{tag}.jpg"
-            _crop(region_bbs[i], fn)
-            manifest.append({"file": fn, "page": pno + 1, "fig": (f"Fig{num}" if num is not None else None),
-                             "label": d["label"], "score": d["score"], "bbox_pt": [round(x, 1) for x in region_bbs[i]]})
+                if num is not None:
+                    pl = _panel_of(region_bbs[i], plabels)
+                    base = f"Fig{num}_{pl}" if pl else f"Fig{num}_{d['label']}"
+                else:
+                    base = f"x_{d['label']}"
+                seen[base] = seen.get(base, 0) + 1
+                tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
+                _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
+                      fig=(f"Fig{num}" if num is not None else None), label=d["label"])
+            continue
+        # ── 既定：図ごとに一括（全体）
+        wholes = _whole_figures(region_bbs, assign, caps)
+        for num in sorted(wholes):
+            if want is not None and num not in want:
+                continue
+            _crop(wholes[num], f"fig_p{pno+1:02d}_Fig{num}.jpg", fig=f"Fig{num}", label="figure")
+        if want is None:                                           # 番号に属さない領域は個別フォールバック
+            xn = 0
+            for i, d in enumerate(regions):
+                if i not in assign:
+                    xn += 1
+                    _crop(region_bbs[i], f"fig_p{pno+1:02d}_x{xn:02d}_{d['label']}.jpg",
+                          fig=None, label=d["label"])
     json.dump(manifest, open(os.path.join(out_dir, "figures.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
     print(f"device={dev}  pages={len(doc)}  figures={len(manifest)}"
@@ -545,8 +572,9 @@ def serve(device="auto", port=None):
     class Req(BaseModel):
         pdf: str
         out_dir: str
-        figs: list[int] | None = None           # 例 [1,2]＝キャプションFig番号で選ぶ
-        top: int | None = None                  # 例 2＝各ページ上から2図（位置基準・密ページ確実）
+        figs: list[int] | None = None           # 例 [1,2]＝その Fig 番号だけ
+        top: int | None = None                  # 例 2＝各ページ上から2図（位置基準・密ページ用）
+        panels: bool = False                    # True＝a/b/c パネル分割（既定 False＝図ごと一括）
 
     @app.get("/health")
     def health():
@@ -556,7 +584,7 @@ def serve(device="auto", port=None):
     def _extract(r: Req):
         import time as _t
         s = _t.perf_counter()
-        man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top)
+        man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top, panels=r.panels)
         return {"device": model[1], "elapsed_s": round(_t.perf_counter() - s, 3),
                 "n": len(man), "figures": man}
 
