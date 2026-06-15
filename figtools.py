@@ -376,16 +376,28 @@ def _engine(device):
     return _load_model(device)                    # torch (xpu/cuda)
 
 
-def _captions(preds, s, page):
-    """figure_title から (bbox_pt, ラベル'Fig3', 番号) を作る。
-    本文/セクション見出しは 'Fig|Table N' 始まりでないので CAP_RE で弾く。"""
-    import fitz
+_PANEL_RE = re.compile(r"^\(?([a-h])\)?$")        # (a) / a) / a 等のパネル記号（括弧なし裸文字も）。誤検出は _panel_of の位置判定で抑制
+
+def _line_boxes(page):
+    """PDFテキスト層の各行を (text, bbox_pt) で返す（キャプション/パネル記号の検出に使う）。"""
     out = []
-    for d in preds:
-        if d["label"] not in CAP_LABELS:
-            continue
-        bb = tuple(x * s for x in d["bbox"])
-        txt = " ".join(page.get_textbox(fitz.Rect(*bb)).split())
+    for b in page.get_text("dict").get("blocks", []):
+        for ln in b.get("lines", []):
+            sp = ln.get("spans", [])
+            if not sp:
+                continue
+            txt = "".join(s["text"] for s in sp).strip()
+            bb = (min(s["bbox"][0] for s in sp), min(s["bbox"][1] for s in sp),
+                  max(s["bbox"][2] for s in sp), max(s["bbox"][3] for s in sp))
+            out.append((txt, bb))
+    return out
+
+
+def _text_captions(page):
+    """**PDFテキスト層から直接** 「Fig.N / Table N で始まる行」を拾う（モデルの figure_title 検出漏れに非依存）。
+    返り値 [(bbox_pt, 'Fig2', 2), ...]。bbox は PDF point。"""
+    out = []
+    for txt, bb in _line_boxes(page):
         mm = CAP_RE.match(txt)
         if mm:
             kind = "Table" if mm.group(1).lower().startswith("tab") else "Fig"
@@ -393,73 +405,59 @@ def _captions(preds, s, page):
     return out
 
 
-def _match_cap(fig_pt, caps):
-    """図に最も近い（水平重複＋下端付近を優先）キャプションを返す → (ラベル, 番号) or (None,None)。"""
-    fx0, fy0, fx1, fy1 = fig_pt
-    best, bestd = (None, None), 1e9
-    for bb, label, num in caps:
-        cx0, cy0, cx1, cy1 = bb
-        if cx1 < fx0 - 5 or cx0 > fx1 + 5:          # 水平に重なる物だけ
-            continue
-        d = abs(cy0 - fy1) if cy0 >= fy0 - 5 else 1e6   # 図の下端付近を優先
-        if d < bestd:
-            best, bestd = (label, num), d
+def _panel_labels(page):
+    """テキスト層から (a)..(h) のパネル記号を位置つきで拾う。返り値 [(bbox_pt, 'a'), ...]。"""
+    out = []
+    for txt, bb in _line_boxes(page):
+        mm = _PANEL_RE.match(txt)
+        if mm:
+            out.append((bb, mm.group(1)))
+    return out
+
+
+def _panel_of(region_bb, panels):
+    """図領域の左上付近にあるパネル記号を返す（'a' 等）。無ければ None。"""
+    fx0, fy0, fx1, fy1 = region_bb
+    fw, fh = max(1.0, fx1 - fx0), max(1.0, fy1 - fy0)
+    best, bestd = None, 1e9
+    for (px0, py0, px1, py1), lab in panels:
+        cx, cy = (px0 + px1) / 2, (py0 + py1) / 2
+        if fx0 - 6 <= cx <= fx0 + 0.55 * fw and fy0 - 6 <= cy <= fy0 + 0.35 * fh:  # 領域の左上域
+            d = (cx - fx0) + (cy - fy0)
+            if d < bestd:
+                best, bestd = lab, d
     return best
 
 
-def _assign_fignums(region_bbs, caps):
-    """各キャプション(実Fig番号・一意)を直上の図領域に割当てる（同カラム・横重なり≥0.5・直下）。
-    番号はキャプション側が持つので、そのページが図5始まりでも実番号が付く。返り値 {region_index: num}。"""
+def _assign_bands(region_bbs, caps):
+    """各図領域を「同カラムで直下にある最も近いキャプション」の Fig 番号に割当てる（union しない）。
+    多パネル図は同じ番号を共有（領域ごとに別ファイルで出す）。番号はキャプション側が持つので、
+    そのページが図5始まりでも実番号が付く。返り値 {region_index: num}。"""
+    cs = sorted(caps, key=lambda c: c[0][1])
     assign = {}
-    for cbb, _label, num in sorted(caps, key=lambda c: c[0][1]):   # 上のキャプションから順に貪欲割当
-        cx0, cy0, cx1, cy1 = cbb
-        best, bestscore = None, -1.0
-        for i, (fx0, fy0, fx1, fy1) in enumerate(region_bbs):
-            if i in assign:
+    for i, (fx0, fy0, fx1, fy1) in enumerate(region_bbs):
+        fw = max(1.0, fx1 - fx0)
+        best, bestgap = None, 1e9
+        for cbb, _l, num in cs:
+            cx0, cy0, cx1, cy1 = cbb
+            ov = min(fx1, cx1) - max(fx0, cx0)
+            if ov <= 0.2 * min(fw, cx1 - cx0):          # 同カラム（横が重なる）だけ
                 continue
-            inter = max(0.0, min(fx1, cx1) - max(fx0, cx0))
-            ov = inter / max(1.0, min(fx1 - fx0, cx1 - cx0))       # 横の重なり率
-            gap = cy0 - fy1                                         # 図下端→キャプション上端
-            if ov >= 0.5 and -8 <= gap <= 120:                     # 直下に接する同カラムの図のみ
-                score = ov - gap / 300.0
-                if score > bestscore:
-                    best, bestscore = i, score
-        if best is not None:
-            assign[best] = num
+            gap = cy0 - fy1                             # 図の下端→キャプション上端
+            if -8 <= gap < bestgap:                     # 直下で最も近いキャプション＝その図の番号
+                best, bestgap = num, gap
+        if best is not None and bestgap < 350:          # 遠すぎる対応は捨てる
+            assign[i] = best
     return assign
 
 
-def _figure_bands(region_bbs, caps):
-    """Fig.N ごとに**図全体(全パネル)の union bbox** を返す {num: (x0,y0,x1,y1)}。
-    各キャプションの「カラム(キャプション横幅で定義)」内で、キャプション上端より上・
-    同カラムの直近の上方キャプション下端より下、にある図領域(=そのFigの全パネル)を束ねる。
-    マルチパネル図(a〜e 等)を1枚にまとめる。2カラムはキャプション横幅で左右を区別。"""
-    cs = sorted(caps, key=lambda c: c[0][1])      # 上から
-    bands = {}
-    for cbb, _l, num in cs:
-        cx0, cy0, cx1, cy1 = cbb
-        cw = max(1.0, cx1 - cx0)
-        lower = 0.0                                # 同カラムで上にある直近キャプション下端＝帯の下限
-        for cbb2, _2, _3 in cs:
-            ox = min(cx1, cbb2[2]) - max(cx0, cbb2[0])
-            if cbb2[3] <= cy0 and ox > 0.3 * cw:
-                lower = max(lower, cbb2[3])
-        members = [r for r in region_bbs
-                   if r[1] >= lower - 6 and r[3] <= cy0 + 6           # 帯(前キャプ下端〜このキャプ上端)
-                   and (min(r[2], cx1) - max(r[0], cx0)) > 0.2 * min(r[2] - r[0], cw)]  # 同カラム
-        if members:
-            bands[num] = (min(r[0] for r in members), min(r[1] for r in members),
-                          max(r[2] for r in members), max(r[3] for r in members))
-    return bands
-
-
 def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
-    """切り出す図を絞れる（絞れば切出コストも減＝DPI微最適化は不要）:
-      figs=[1,2] … キャプションの Fig 番号で選ぶ（普通の論文向け・密ページは不正確なことあり）
-      top=2      … 各ページ上から2つの図だけ（位置基準＝密ページでも確実。Fig.1,2 は通常これで取れる）
-      両方 None  … 全図。
-    ※ reading-order による厳密なFig↔キャプション対応はモデルが内部で持つが predict は捨てており、
-      MinerU本体の対応も密ページでは不正確なため、確実性が要る密ページは top=（位置）を使う。"""
+    """**領域ごと**に切り出す（モデル検出のまま＝クリーン。union はしない）。各領域に所属 Fig 番号を付与:
+      figs=[1,2] … Fig.1,2 に属する図/パネルを（個別ファイルで）全部切る。Fig5 始まりページでも実番号で当たる
+      top=2      … 各ページ上から2領域だけ（位置基準・密ページ用フォールバック）
+      両方 None  … 全図（各領域 Fig{n}_… か、番号不明は x## で命名）。
+    番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（_assign_bands）。
+    超高密度ページ(IEDM級)は図とキャプションが入り組み番号付けが不正確になり得る（その時は top=）。"""
     import fitz
     m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
     os.makedirs(out_dir, exist_ok=True)
@@ -474,7 +472,8 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
         pix = page.get_pixmap(dpi=DET_DPI)
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         preds = m.predict(img)
-        caps = _captions(preds, s, page)
+        caps = _text_captions(page)                                # テキスト層からFig.N行を直接(検出漏れに強い)
+        panels = _panel_labels(page)                               # (a)(b)… パネル記号
         regions = [d for d in preds if d["label"] in FIG_LABELS]
         regions.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))   # 上→下, 左→右
         if not regions:
@@ -488,37 +487,31 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
             cpix[1].crop(tuple(round(v * cs) for v in bb)).save(os.path.join(out_dir, fn), quality=90)
 
-        if want is not None:                                       # ★figs指定＝図全体(全パネル)を帯で束ねて切る
-            bands = _figure_bands(region_bbs, caps)
-            for num in sorted(want):
-                if num not in bands:
-                    continue
-                bb = bands[num]
-                fn = f"fig_p{pno+1:02d}_Fig{num}.jpg"
-                _crop(bb, fn)
-                manifest.append({"file": fn, "page": pno + 1, "fig": f"Fig{num}",
-                                 "label": "figure", "bbox_pt": [round(x, 1) for x in bb]})
-            continue
-        # top / 全図 ＝ パネル(region)単位
+        assign = _assign_bands(region_bbs, caps)                   # 各領域→所属Fig番号（union しない）
         if top:
             regions, region_bbs = regions[:top], region_bbs[:top]  # 位置で上から top 個
-        fignum = _assign_fignums(region_bbs, caps)                 # キャプション直上割当＝実Fig番号
-        seen, idx = {}, 0
+        seen, xn = {}, 0
         for i, d in enumerate(regions):
-            bb_pt = region_bbs[i]
-            num = fignum.get(i)
-            idx += 1
-            if top is not None:                          # 位置基準モード＝順位で命名（不確実なFig番号は使わない）
-                tag = f"top{idx:02d}_{d['label']}"
-            elif num is not None:                        # 実Fig番号（同番号の複数パネルは -2,-3…）
-                seen[num] = seen.get(num, 0) + 1
-                tag = f"Fig{num}_{d['label']}" + (f"-{seen[num]}" if seen[num] > 1 else "")
+            num = assign.get(i)
+            if top is None and want is not None and num not in want:   # figs指定＝その番号の図(全パネル)
+                continue
+            if top is not None:                          # 位置基準＝順位で命名（番号は使わない）
+                xn += 1
+                tag = f"top{xn:02d}_{d['label']}"
+            elif num is not None:                        # 実Fig番号＋パネル記号(a/b/…)。記号無しはラベル
+                pl = _panel_of(region_bbs[i], panels)
+                base = f"Fig{num}_{pl}" if pl else f"Fig{num}_{d['label']}"
+                seen[base] = seen.get(base, 0) + 1       # 同名は -2,-3… で衝突回避
+                tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
             else:
-                tag = f"x{idx:02d}_{d['label']}"         # キャプション割当無し＝連番フォールバック
+                if want is not None:                     # figs指定時、番号不明領域はスキップ
+                    continue
+                xn += 1
+                tag = f"x{xn:02d}_{d['label']}"          # キャプション割当無し＝連番フォールバック
             fn = f"fig_p{pno+1:02d}_{tag}.jpg"
-            _crop(bb_pt, fn)
+            _crop(region_bbs[i], fn)
             manifest.append({"file": fn, "page": pno + 1, "fig": (f"Fig{num}" if num is not None else None),
-                             "label": d["label"], "score": d["score"], "bbox_pt": [round(x, 1) for x in bb_pt]})
+                             "label": d["label"], "score": d["score"], "bbox_pt": [round(x, 1) for x in region_bbs[i]]})
     json.dump(manifest, open(os.path.join(out_dir, "figures.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
     print(f"device={dev}  pages={len(doc)}  figures={len(manifest)}"
