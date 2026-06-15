@@ -1,0 +1,20 @@
+# 生成物・環境（リポジトリには入れない＝setup と初回実行で作られる）
+.venv/
+models/*.xml
+models/*.bin
+models/cache/
+__pycache__/
+*.pyc
+
+# 入出力・著作物（論文PDF等は絶対にコミットしない）
+out/
+output/
+*.pdf
+*.jpg
+*.jpeg
+*.png
+figures.json
+
+# logs/test
+*.log
+_testout/

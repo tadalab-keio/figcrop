@@ -1,0 +1,19 @@
+figcrop
+Copyright 2026 TadaLab (Keio University)
+
+Licensed under the Apache License, Version 2.0.
+
+This product depends on and is built upon third-party software:
+
+- MinerU (https://github.com/opendatalab/MinerU)
+  Licensed under the "MinerU Open Source License" (based on Apache 2.0 with
+  additional terms). figcrop uses MinerU's layout model (PP-DocLayoutV2) and
+  adapts a small portion of MinerU's detection post-processing logic and its
+  class-label list into figtools.py (the OpenVINO path). MinerU itself is not
+  redistributed here; it is installed as a dependency.
+
+- OpenVINO (https://github.com/openvinotoolkit/openvino) — Apache License 2.0.
+- PyMuPDF (https://github.com/pymupdf/PyMuPDF).
+
+Model weights (PP-DocLayoutV2 etc.) are downloaded at runtime from Hugging Face
+and are governed by their own licenses; they are not included in this repository.

@@ -1,0 +1,6 @@
+# figcrop の依存（base）。device 別の torch(+xpu/+cuda) は setup.ps1 が別途入れる。
+# これ自体は何もしない＝ `pip install -r requirements.txt` を実行した時だけ venv に入る。
+mineru[core]>=2,<4
+openvino>=2025
+pymupdf>=1.24
+numpy

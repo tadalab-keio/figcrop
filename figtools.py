@@ -1,0 +1,584 @@
+# -*- coding: utf-8 -*-
+"""figcrop / figtools = ①手動精密クロップ ②レイアウト自動抽出 ③常駐サーバ を1ファイルに。
+論文PDFから図を抽出。検出は OpenVINO(既定)/torch、キャプション対応と図全体の束ね(帯)は自前幾何。
+
+セットアップ: setup.ps1 (Windows) / setup.sh。以下 <py> = プロジェクトの venv python（.venv/Scripts/python.exe 等）。
+- **②抽出CLI**:  <py> figtools.py extract <pdf> <out_dir> [auto|GPU|NPU|xpu|cuda] [figs=1,2]
+- **③常駐サーバ**: <py> figtools.py serve auto    （既定 auto→OpenVINO GPU・127.0.0.1:8077）
+      POST /extract {pdf,out_dir,figs?,top?}  →  figs=[1,2]=実Fig番号で図全体 / top=2=上から2図
+- **①手動クロップ**（grid/render/borders/find系/extract_figures/gaps/vlm_figures）は import して使用:
+    import importlib.util,sys; sys.dont_write_bytecode=True
+    z=importlib.util.module_from_spec(importlib.util.spec_from_file_location("z","figtools.py")); ...
+重い import は全て関数内＝両環境で安全に import 可。検出モデルは MinerU の PP-DocLayoutV2（初回 IR 自動生成）。
+Built on MinerU (https://github.com/opendatalab/MinerU) + OpenVINO。詳細は README.md。
+"""
+import sys, os, json, io, re, fitz
+from collections import defaultdict
+
+try:                                            # Windows コンソール(cp932)でも µ 等を出せるように
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# ② レイアウト抽出の定数
+FIG_LABELS = {"image", "chart", "table"}        # 切り出す対象（視覚的な図）
+CAP_LABELS = {"figure_title"}                   # キャプション行
+DET_DPI = 150                                   # 検出用レンダリング解像度
+CROP_DPI = 300                                  # 切り出し解像度（原寸）
+CAP_RE = re.compile(r"(?i)^\s*(fig(?:ure)?|table)\.?\s*(\d+)")   # 「Fig 3」始まりのみ＝本文/見出し誤検出を排除
+# PP-DocLayoutV2 のクラス（label_id→名前。OpenVINO版の後処理で使用）
+PP_LABELS = ["abstract", "algorithm", "aside_text", "chart", "content", "display_formula",
+             "doc_title", "figure_title", "footer", "footer_image", "footnote", "formula_number",
+             "header", "header_image", "image", "inline_formula", "number", "paragraph_title",
+             "reference", "reference_content", "seal", "table", "text", "vertical_text", "vision_footnote"]
+OV_IR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "layout.xml")  # IR保存先(プロジェクト相対・初回torchから自動生成)
+
+
+# ========================= ① 手動精密クロップ（主環境）=========================
+_CAP_RE = re.compile(r'^(fig|figure|table)\.?\s*\d', re.I)
+
+
+def _caption_lines(page):
+    words = page.get_text('words')
+    lines = defaultdict(list)
+    for w in words:
+        lines[(w[5], w[6])].append(w)
+    rects = []
+    keys = set()
+    for k, ws in lines.items():
+        ws = sorted(ws, key=lambda w: w[0])
+        text = ' '.join(w[4] for w in ws)
+        if _CAP_RE.match(text) or ws[0][4].rstrip('.').lower() in ('figure', 'fig', 'table'):
+            keys.add(k)
+            rects.append(fitz.Rect(min(w[0] for w in ws), min(w[1] for w in ws),
+                                   max(w[2] for w in ws), max(w[3] for w in ws)))
+    return keys, rects
+
+
+def extract_figures(page, gap=10, min_graphic_area=3000):
+    g_rects = [fitz.Rect(r) for r in page.cluster_drawings(x_tolerance=gap, y_tolerance=gap)]
+    for img in page.get_images(full=True):
+        for r in page.get_image_rects(img[0]):
+            g_rects.append(fitz.Rect(r))
+    g_rects = [r for r in g_rects if r.width > 1 and r.height > 1 and r.width < page.rect.width]
+
+    cap_keys, cap_rects = _caption_lines(page)
+    words = page.get_text('words')
+    w_rects = [fitz.Rect(w[:4]) for w in words if (w[5], w[6]) not in cap_keys]
+
+    nodes = [(r, True) for r in g_rects] + [(r, False) for r in w_rects]
+    n = len(nodes)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    rects = [r for r, _ in nodes]
+    isg = [g for _, g in nodes]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if (rects[i] + (-gap, -gap, gap, gap)).intersects(rects[j]):
+                union(i, j)
+
+    comp_box = {}
+    comp_garea = defaultdict(float)
+    for i in range(n):
+        r = find(i)
+        comp_box[r] = (comp_box[r] | rects[i]) if r in comp_box else fitz.Rect(rects[i])
+        if isg[i]:
+            comp_garea[r] += rects[i].width * rects[i].height
+
+    figs = [(comp_box[r], comp_garea[r]) for r in comp_box if comp_garea[r] >= min_graphic_area]
+    clamped = []
+    for b, a in figs:
+        below = [c.y0 for c in cap_rects if c.y0 >= b.y0 + 0.3 * b.height and c.y0 <= b.y1 + 6
+                 and c.x0 < b.x1 and c.x1 > b.x0]
+        if below:
+            b = fitz.Rect(b.x0, b.y0, b.x1, min(b.y1, min(below) - 2))
+        clamped.append(((b & page.rect), a))
+    clamped.sort(key=lambda t: -t[1])
+    return clamped
+
+
+def _page(src, page=0):
+    """src が str(PDFパス)なら開いて page を返す。Page オブジェクトならそのまま返す。"""
+    if isinstance(src, str):
+        return fitz.open(src)[page]
+    return src
+
+
+def render(src, page_or_bbox, bbox_or_out, out_or_dpi=None, dpi=300):
+    """切り出し描画。2通りの呼び方:
+      render(page_obj, bbox, out, dpi=300)
+      render(pdf_path, page_no, (x0,y0,x1,y1), out, dpi=300)
+    """
+    if isinstance(src, str):
+        pg = fitz.open(src)[page_or_bbox]
+        bbox, out = bbox_or_out, out_or_dpi
+    else:
+        pg = src
+        bbox, out = page_or_bbox, bbox_or_out
+    pg.get_pixmap(dpi=dpi, clip=fitz.Rect(bbox)).save(out)
+    return out
+
+
+def borders(src, page=0, region=None, min_w=80, min_h=40):
+    """**矩形ストローク（枠・テーブル罫線の囲み）を面積降順で返す**: [(x0,y0,x1,y1,w,h),...]。
+    figure/table の外枠を PDF ベクタから厳密座標で拾い、その枠ぴったり（線を含め±1pt外側）で切る用。
+    画像認識やグリッド目視より正確。枠が密接に入れ子（図自身の枠＋まとめ枠）でも面積順で区別できる。
+    ※枠がラスタに焼かれている場合はベクタに出ないので、その時だけ opencv 等が必要。"""
+    pg = _page(src, page)
+    clip = fitz.Rect(*region) if region else pg.rect
+    seen, out = set(), []
+    for d in pg.get_drawings():
+        r = fitz.Rect(d['rect'])
+        if r.width >= min_w and r.height >= min_h and r.intersects(clip):
+            key = (round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((round(r.x0, 1), round(r.y0, 1), round(r.x1, 1), round(r.y1, 1),
+                        round(r.width, 1), round(r.height, 1)))
+    out.sort(key=lambda t: -(t[4] * t[5]))
+    return out
+
+
+def grid(src, page=0, dpi=110, step=50, region=None, out=None):
+    """ページ(or region)を **座標グリッド付き**で描画して out に保存。
+    赤=x(pt)縦線・青=y(pt)横線を step pt 刻みでラベル付き。これを Read すれば
+    図/サブパネルの bbox を pt 単位で目視で読める（所在特定＆精密クロップの主役）。"""
+    import math
+    from PIL import Image, ImageDraw
+    pg = _page(src, page)
+    clip = fitz.Rect(*region) if region else pg.rect
+    pix = pg.get_pixmap(dpi=dpi, clip=clip)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    d = ImageDraw.Draw(img)
+    s = dpi / 72.0
+    x0, y0 = clip.x0, clip.y0
+    for xpt in range(int(math.floor(x0 / step) * step), int(clip.x1) + 1, step):
+        px = int(round((xpt - x0) * s))
+        if 0 <= px < img.width:
+            d.line([(px, 0), (px, img.height)], fill=(230, 60, 60), width=1)
+            d.text((px + 2, 2), str(xpt), fill=(190, 0, 0))
+    for ypt in range(int(math.floor(y0 / step) * step), int(clip.y1) + 1, step):
+        py = int(round((ypt - y0) * s))
+        if 0 <= py < img.height:
+            d.line([(0, py), (img.width, py)], fill=(60, 60, 230), width=1)
+            d.text((2, py + 1), str(ypt), fill=(0, 0, 190))
+    if out is None:
+        out = "grid.jpg"
+    img.save(out, quality=85)
+    return out
+
+
+def gaps(src, page=0, region=None, axis="y", dpi=150, min_gap=4, white=245):
+    """region 内の **空白帯（パネル境界）** を投影法で検出し、pt 単位の (start,end,幅) リストを返す。
+    axis='y' で水平帯（行の隙間）、'x' で垂直帯（列の隙間）。ラスタ/密図のパネル分割の目安に。"""
+    from PIL import Image
+    pg = _page(src, page)
+    clip = fitz.Rect(*region) if region else pg.rect
+    pix = pg.get_pixmap(dpi=dpi, clip=clip)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("L")
+    W, H = img.size
+    px = img.load()
+    s = dpi / 72.0
+    if axis == "y":
+        occ = [any(px[x, y] < white for x in range(0, W, 2)) for y in range(H)]
+    else:
+        occ = [any(px[x, y] < white for y in range(0, H, 2)) for x in range(W)]
+    runs = []
+    st = None
+    for i, v in enumerate(occ):
+        if not v and st is None:
+            st = i
+        elif v and st is not None:
+            runs.append((st, i - 1))
+            st = None
+    if st is not None:
+        runs.append((st, len(occ) - 1))
+    base = clip.y0 if axis == "y" else clip.x0
+    out = [(round(base + a / s, 1), round(base + b / s, 1), round((b - a) / s, 1))
+           for a, b in runs if (b - a) / s >= min_gap]
+    return out
+
+
+def vlm_figures(src, page, out_dir=None, dpi=300, also_tables=True, device="auto"):
+    """**密ページ（図だけが密に並び grid/連結成分では1塊になる）専用の自動図分割**。
+    Docling の VLM パイプライン（GraniteDocling 視覚モデル・258M）でページを画像として解釈し、
+    図/表を個別領域に分割。`[(bbox(pt,TOPLEFT), kind, caption_or_None), ...]` を返す。
+    out_dir 指定時は各領域を dpi で fig{n}.jpg に切り出す（**最後は必ず Read で目視**）。
+
+    device: "auto"（既定＝XPU/Intel Arc GPU が使えれば XPU、無ければ CPU）/ "xpu" / "cuda" / "cpu"。
+      GraniteDocling は XPU 正式対応。**XPU は速度のため＝分割の精度はモデル依存で CPU と同じ**。
+
+    注意:
+    - **CPU だと1ページ数分と遅い**（XPU で短縮）。普通の本文+図ページは grid/borders/find_tables の方が速く確実。
+      「全面1塊になって手に負えない密ページ」専用の最後の手段。
+    - 分割に粗さが残る（隣接図を束ねる/1図を数片に割る）ことがある＝出力 bbox を grid で微調整してよい。
+    - 要 `pip install docling`（導入済 2.102.x）。実測: IEDM 密ページを 11 領域に分離（2026-06-14）。
+    """
+    import fitz
+    import torch
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import VlmPipelineOptions
+    from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+    from docling.datamodel.vlm_model_specs import GRANITEDOCLING_TRANSFORMERS
+    from docling.pipeline.vlm_pipeline import VlmPipeline
+    from docling_core.types.doc import PictureItem, TableItem, CoordOrigin
+
+    if device == "auto":
+        device = "xpu" if (getattr(torch, "xpu", None) and torch.xpu.is_available()) else "cpu"
+    dev = {"xpu": AcceleratorDevice.XPU, "cuda": AcceleratorDevice.CUDA,
+           "cpu": AcceleratorDevice.CPU}[device]
+    opts = VlmPipelineOptions(vlm_options=GRANITEDOCLING_TRANSFORMERS,
+                              accelerator_options=AcceleratorOptions(device=dev))
+
+    ph = fitz.open(src)[page].rect.height
+    conv = DocumentConverter(format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_cls=VlmPipeline, pipeline_options=opts)})
+    # 注意: 本ツールは page を fitz 流の 0 始まりで受けるが、docling の page_range は 1 始まり。
+    doc = conv.convert(source=src, page_range=(page + 1, page + 1)).document
+
+    kinds = (PictureItem, TableItem) if also_tables else (PictureItem,)
+    out = []
+    for el, _lvl in doc.iterate_items():
+        if not isinstance(el, kinds) or not getattr(el, "prov", None):
+            continue
+        bb = el.prov[0].bbox
+        if bb.coord_origin == CoordOrigin.BOTTOMLEFT:
+            bb = bb.to_top_left_origin(ph)
+        rect = (round(bb.l, 1), round(bb.t, 1), round(bb.r, 1), round(bb.b, 1))
+        try:
+            cap = el.caption_text(doc) or None
+        except Exception:
+            cap = None
+        out.append((rect, "table" if isinstance(el, TableItem) else "picture", cap))
+
+    if out_dir:
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+        pg = fitz.open(src)[page]
+        for i, (r, _k, _c) in enumerate(out):
+            pg.get_pixmap(dpi=dpi, clip=fitz.Rect(*r)).save(os.path.join(out_dir, f"fig{i + 1}.jpg"))
+    return out
+
+
+# ========================= ② レイアウト自動抽出（mineru-env）=========================
+def _load_model(device):
+    """torch 版レイアウト検出（cpu/cuda/xpu）。.predict(pil)→[{label,score,bbox,index}]。"""
+    import torch
+    from mineru.model.layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
+    from mineru.utils.enum_class import ModelPath
+    from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
+    if device == "auto":
+        device = "xpu" if (getattr(torch, "xpu", None) and torch.xpu.is_available()) else "cpu"
+    weight = os.path.join(auto_download_and_get_model_root_path(ModelPath.pp_doclayout_v2),
+                          ModelPath.pp_doclayout_v2)
+    m = PPDocLayoutV2LayoutModel(weight, device=device)
+    half = (device == "xpu")
+    if half:                                   # XPU は fp16 で XMX を使い約1.5倍速・精度同等
+        m.model.half()
+        o = m._preprocess_single_image
+        m._preprocess_single_image = lambda im, _o=o: (lambda pv, ts: (pv.half(), ts))(*_o(im))
+    return m, device
+
+
+def _export_ov_ir(out_xml=OV_IR):
+    """torch の PP-DocLayoutV2 を OpenVINO IR に変換して保存（初回のみ・要 torch+mineru）。
+    出力は (logits, pred_boxes) だけのラッパー＝reading-order は捨てる（キャプションは自前幾何で対応）。"""
+    import torch, openvino as ov
+    from mineru.model.layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
+    from mineru.utils.enum_class import ModelPath
+    from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
+    weight = os.path.join(auto_download_and_get_model_root_path(ModelPath.pp_doclayout_v2),
+                          ModelPath.pp_doclayout_v2)
+    m = PPDocLayoutV2LayoutModel(weight, device="cpu")
+
+    class _W(torch.nn.Module):
+        def __init__(s, mdl):
+            super().__init__(); s.m = mdl.eval()
+
+        def forward(s, pixel_values):
+            o = s.m(pixel_values=pixel_values)
+            return o.logits, o.pred_boxes
+
+    ovm = ov.convert_model(_W(m.model), example_input=torch.randn(1, 3, 800, 800))
+    ovm.reshape([1, 3, 800, 800])                 # 静的形状（NPU必須・GPU最適化）
+    os.makedirs(os.path.dirname(out_xml), exist_ok=True)
+    ov.save_model(ovm, out_xml)
+    return out_xml
+
+
+class OVLayout:
+    """OpenVINO 版レイアウト検出（**torch非依存・起動はIR+キャッシュで数秒・推論~33ms**）。
+    .predict(pil)→[{label,score,bbox,index}]（torch版と同形式）。RT-DETR 後処理を自前で復元。"""
+    IMGSZ = (800, 800)
+    CONF = 0.45
+
+    def __init__(self, device="GPU"):
+        import openvino as ov
+        if not os.path.exists(OV_IR):
+            _export_ov_ir(OV_IR)                  # 初回だけ torch から変換
+        core = ov.Core()
+        core.set_property({"CACHE_DIR": os.path.join(os.path.dirname(OV_IR), "cache")})  # device コンパイルをキャッシュ
+        self.device = device
+        self.cm = core.compile_model(OV_IR, device)
+
+    def predict(self, pil):
+        import numpy as np
+        from PIL import Image
+        W, H = pil.size
+        im = pil.convert("RGB").resize(self.IMGSZ, Image.BICUBIC)
+        x = (np.asarray(im, dtype=np.float32).transpose(2, 0, 1)[None]) / 255.0
+        a, b = self.cm(x).to_tuple()[:2]
+        logits, boxes = (b[0], a[0]) if a.shape[-1] == 4 else (a[0], b[0])   # (Q,C),(Q,4)
+        c, d = boxes[:, :2], boxes[:, 2:]
+        xyxy = np.concatenate([c - 0.5 * d, c + 0.5 * d], -1) * np.array([W, H, W, H], np.float32)
+        scores = 1.0 / (1.0 + np.exp(-logits))    # sigmoid [Q,C]
+        Q, C = scores.shape
+        flat = scores.ravel()
+        idx = np.argpartition(-flat, Q - 1)[:Q]   # 上位 Q（torch の topk(num_top_queries) 相当）
+        res = []
+        for j in idx:
+            sc = float(flat[j])
+            if sc < self.CONF:
+                continue
+            q, lab = int(j // C), int(j % C)
+            x0, y0, x1, y1 = xyxy[q]
+            x0, x1 = max(0.0, min(W, x0)), max(0.0, min(W, x1))
+            y0, y1 = max(0.0, min(H, y0)), max(0.0, min(H, y1))
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            res.append({"label": PP_LABELS[lab] if lab < len(PP_LABELS) else str(lab),
+                        "score": round(sc, 4), "index": 0,
+                        "bbox": [float(x0), float(y0), float(x1), float(y1)]})   # np.float32→pythonでJSON可
+        return res
+
+
+def _engine(device):
+    """device 名で torch/OpenVINO を振り分け (predictor, 表示名) を返す。
+    OpenVINO（起動キャッシュで速い・推論~33ms・torch非依存）: 'auto'|'ov'|'GPU'|'NPU'|'CPU'（auto/ov→GPU）。
+    torch（fp16等）: 'xpu'|'cuda'。"""
+    if device in ("auto", "ov"):
+        return OVLayout("GPU"), "ov:GPU"
+    if device.upper() in ("GPU", "NPU", "CPU"):
+        return OVLayout(device.upper()), f"ov:{device.upper()}"
+    return _load_model(device)                    # torch (xpu/cuda)
+
+
+def _captions(preds, s, page):
+    """figure_title から (bbox_pt, ラベル'Fig3', 番号) を作る。
+    本文/セクション見出しは 'Fig|Table N' 始まりでないので CAP_RE で弾く。"""
+    import fitz
+    out = []
+    for d in preds:
+        if d["label"] not in CAP_LABELS:
+            continue
+        bb = tuple(x * s for x in d["bbox"])
+        txt = " ".join(page.get_textbox(fitz.Rect(*bb)).split())
+        mm = CAP_RE.match(txt)
+        if mm:
+            kind = "Table" if mm.group(1).lower().startswith("tab") else "Fig"
+            out.append((bb, f"{kind}{int(mm.group(2))}", int(mm.group(2))))
+    return out
+
+
+def _match_cap(fig_pt, caps):
+    """図に最も近い（水平重複＋下端付近を優先）キャプションを返す → (ラベル, 番号) or (None,None)。"""
+    fx0, fy0, fx1, fy1 = fig_pt
+    best, bestd = (None, None), 1e9
+    for bb, label, num in caps:
+        cx0, cy0, cx1, cy1 = bb
+        if cx1 < fx0 - 5 or cx0 > fx1 + 5:          # 水平に重なる物だけ
+            continue
+        d = abs(cy0 - fy1) if cy0 >= fy0 - 5 else 1e6   # 図の下端付近を優先
+        if d < bestd:
+            best, bestd = (label, num), d
+    return best
+
+
+def _assign_fignums(region_bbs, caps):
+    """各キャプション(実Fig番号・一意)を直上の図領域に割当てる（同カラム・横重なり≥0.5・直下）。
+    番号はキャプション側が持つので、そのページが図5始まりでも実番号が付く。返り値 {region_index: num}。"""
+    assign = {}
+    for cbb, _label, num in sorted(caps, key=lambda c: c[0][1]):   # 上のキャプションから順に貪欲割当
+        cx0, cy0, cx1, cy1 = cbb
+        best, bestscore = None, -1.0
+        for i, (fx0, fy0, fx1, fy1) in enumerate(region_bbs):
+            if i in assign:
+                continue
+            inter = max(0.0, min(fx1, cx1) - max(fx0, cx0))
+            ov = inter / max(1.0, min(fx1 - fx0, cx1 - cx0))       # 横の重なり率
+            gap = cy0 - fy1                                         # 図下端→キャプション上端
+            if ov >= 0.5 and -8 <= gap <= 120:                     # 直下に接する同カラムの図のみ
+                score = ov - gap / 300.0
+                if score > bestscore:
+                    best, bestscore = i, score
+        if best is not None:
+            assign[best] = num
+    return assign
+
+
+def _figure_bands(region_bbs, caps):
+    """Fig.N ごとに**図全体(全パネル)の union bbox** を返す {num: (x0,y0,x1,y1)}。
+    各キャプションの「カラム(キャプション横幅で定義)」内で、キャプション上端より上・
+    同カラムの直近の上方キャプション下端より下、にある図領域(=そのFigの全パネル)を束ねる。
+    マルチパネル図(a〜e 等)を1枚にまとめる。2カラムはキャプション横幅で左右を区別。"""
+    cs = sorted(caps, key=lambda c: c[0][1])      # 上から
+    bands = {}
+    for cbb, _l, num in cs:
+        cx0, cy0, cx1, cy1 = cbb
+        cw = max(1.0, cx1 - cx0)
+        lower = 0.0                                # 同カラムで上にある直近キャプション下端＝帯の下限
+        for cbb2, _2, _3 in cs:
+            ox = min(cx1, cbb2[2]) - max(cx0, cbb2[0])
+            if cbb2[3] <= cy0 and ox > 0.3 * cw:
+                lower = max(lower, cbb2[3])
+        members = [r for r in region_bbs
+                   if r[1] >= lower - 6 and r[3] <= cy0 + 6           # 帯(前キャプ下端〜このキャプ上端)
+                   and (min(r[2], cx1) - max(r[0], cx0)) > 0.2 * min(r[2] - r[0], cw)]  # 同カラム
+        if members:
+            bands[num] = (min(r[0] for r in members), min(r[1] for r in members),
+                          max(r[2] for r in members), max(r[3] for r in members))
+    return bands
+
+
+def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None):
+    """切り出す図を絞れる（絞れば切出コストも減＝DPI微最適化は不要）:
+      figs=[1,2] … キャプションの Fig 番号で選ぶ（普通の論文向け・密ページは不正確なことあり）
+      top=2      … 各ページ上から2つの図だけ（位置基準＝密ページでも確実。Fig.1,2 は通常これで取れる）
+      両方 None  … 全図。
+    ※ reading-order による厳密なFig↔キャプション対応はモデルが内部で持つが predict は捨てており、
+      MinerU本体の対応も密ページでは不正確なため、確実性が要る密ページは top=（位置）を使う。"""
+    import fitz
+    m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
+    os.makedirs(out_dir, exist_ok=True)
+    want = set(figs) if figs else None
+    doc = fitz.open(pdf_path)
+    s = 72.0 / DET_DPI                          # 検出画素 -> PDF point
+    cs = CROP_DPI / 72.0                         # PDF point -> 切出画素
+    import PIL.Image as Image
+    manifest = []
+    for pno in range(len(doc)):
+        page = doc[pno]
+        pix = page.get_pixmap(dpi=DET_DPI)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        preds = m.predict(img)
+        caps = _captions(preds, s, page)
+        regions = [d for d in preds if d["label"] in FIG_LABELS]
+        regions.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))   # 上→下, 左→右
+        if not regions:
+            continue
+        region_bbs = [tuple(x * s for x in d["bbox"]) for d in regions]
+        cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
+
+        def _crop(bb, fn):                                         # 必要時に1回だけ高dpi描画→PIL切出
+            if cpix[0] is None:
+                cpix[0] = page.get_pixmap(dpi=CROP_DPI)
+                cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
+            cpix[1].crop(tuple(round(v * cs) for v in bb)).save(os.path.join(out_dir, fn), quality=90)
+
+        if want is not None:                                       # ★figs指定＝図全体(全パネル)を帯で束ねて切る
+            bands = _figure_bands(region_bbs, caps)
+            for num in sorted(want):
+                if num not in bands:
+                    continue
+                bb = bands[num]
+                fn = f"fig_p{pno+1:02d}_Fig{num}.jpg"
+                _crop(bb, fn)
+                manifest.append({"file": fn, "page": pno + 1, "fig": f"Fig{num}",
+                                 "label": "figure", "bbox_pt": [round(x, 1) for x in bb]})
+            continue
+        # top / 全図 ＝ パネル(region)単位
+        if top:
+            regions, region_bbs = regions[:top], region_bbs[:top]  # 位置で上から top 個
+        fignum = _assign_fignums(region_bbs, caps)                 # キャプション直上割当＝実Fig番号
+        seen, idx = {}, 0
+        for i, d in enumerate(regions):
+            bb_pt = region_bbs[i]
+            num = fignum.get(i)
+            idx += 1
+            if top is not None:                          # 位置基準モード＝順位で命名（不確実なFig番号は使わない）
+                tag = f"top{idx:02d}_{d['label']}"
+            elif num is not None:                        # 実Fig番号（同番号の複数パネルは -2,-3…）
+                seen[num] = seen.get(num, 0) + 1
+                tag = f"Fig{num}_{d['label']}" + (f"-{seen[num]}" if seen[num] > 1 else "")
+            else:
+                tag = f"x{idx:02d}_{d['label']}"         # キャプション割当無し＝連番フォールバック
+            fn = f"fig_p{pno+1:02d}_{tag}.jpg"
+            _crop(bb_pt, fn)
+            manifest.append({"file": fn, "page": pno + 1, "fig": (f"Fig{num}" if num is not None else None),
+                             "label": d["label"], "score": d["score"], "bbox_pt": [round(x, 1) for x in bb_pt]})
+    json.dump(manifest, open(os.path.join(out_dir, "figures.json"), "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
+    print(f"device={dev}  pages={len(doc)}  figures={len(manifest)}"
+          + (f"  (figs={sorted(want)})" if want else "") + f" -> {out_dir}")
+    for x in manifest:
+        sc = f"{x['score']:.2f}" if x.get("score") is not None else "-"
+        print(f"  {x['file']}  {x['label']:7} {sc}  {x.get('fig') or ''}")
+    return manifest
+
+# ========================= ③ 常駐サーバ（mineru-env）=========================
+def serve(device="auto", port=None):
+    """モデルを1回だけロードして常駐し、HTTP で図抽出要求を受ける（単発1ページを高速化）。"""
+    import time
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    import uvicorn
+    port = int(port or os.environ.get("FIG_PORT", "8077"))
+    print(f"[fig-server] loading model (device={device}) ...", flush=True)
+    t = time.perf_counter()
+    model = _engine(device)                     # OpenVINO(既定 auto→ov:GPU・起動キャッシュで速い) / torch(xpu,cuda)
+    try:                                        # ★起動時に1回ダミー推論＝(torchならJIT/OVなら初回コンパイル)をここで済ませる
+        from PIL import Image as _I
+        tw = time.perf_counter()
+        model[0].predict(_I.new("RGB", (1024, 1024), "white"))
+        print(f"[fig-server] JIT warmup done in {time.perf_counter()-tw:.1f}s", flush=True)
+    except Exception as e:
+        print("[fig-server] warmup skipped:", repr(e)[:100], flush=True)
+    print(f"[fig-server] ready on {model[1]} in {time.perf_counter()-t:.1f}s", flush=True)
+    app = FastAPI()
+
+    class Req(BaseModel):
+        pdf: str
+        out_dir: str
+        figs: list[int] | None = None           # 例 [1,2]＝キャプションFig番号で選ぶ
+        top: int | None = None                  # 例 2＝各ページ上から2図（位置基準・密ページ確実）
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "device": model[1]}
+
+    @app.post("/extract")
+    def _extract(r: Req):
+        import time as _t
+        s = _t.perf_counter()
+        man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top)
+        return {"device": model[1], "elapsed_s": round(_t.perf_counter() - s, 3),
+                "n": len(man), "figures": man}
+
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "serve":
+        serve(sys.argv[2] if len(sys.argv) > 2 else "auto")
+    elif cmd == "extract":
+        if len(sys.argv) < 4:
+            print("usage: 図切り抜き.py extract <pdf> <out_dir> [auto|xpu|cpu] [figs=1,2]"); sys.exit(1)
+        dev = sys.argv[4] if len(sys.argv) > 4 else "auto"
+        figs = [int(x) for x in sys.argv[5].split(",")] if len(sys.argv) > 5 else None
+        extract(sys.argv[2], sys.argv[3], dev, figs=figs)
+    else:
+        print("usage: 図切り抜き.py serve|extract …  （①手動クロップ関数は主環境で import して使用）")
