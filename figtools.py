@@ -456,14 +456,12 @@ def _union(a, b):
 
 
 def _whole_figures(region_bbs, assign, caps):
-    """Fig.N ごとに **図全体**の bbox を返す {num: bbox}＝所属領域 ∪ キャプション の外接矩形。
-    矩形なので間の本文(プロセス説明文等)も含まれる＝『本の通り』の一括切出。"""
+    """Fig.N ごとに **図本体**の bbox を返す {num: bbox}＝所属領域(image/chart/table)の外接矩形。
+    矩形なので領域の範囲内にある図中テキスト(プロセス説明文・パネル記号等)は入るが、
+    **キャプション行『Fig.N: …』は union に含めない**ので巻き込まない（図だけ欲しい用途）。"""
     out = {}
-    for i, num in assign.items():                    # 所属領域を union
+    for i, num in assign.items():
         out[num] = region_bbs[i] if num not in out else _union(out[num], region_bbs[i])
-    for cbb, _l, num in caps:                          # キャプションも含める（間のテキストを取り込む）
-        if num in out:
-            out[num] = _union(out[num], cbb)
     return out
 
 
