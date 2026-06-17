@@ -50,9 +50,40 @@ bash setup.sh
 `requirements.txt` is a manifest for the base packages. Device-specific torch
 packages are handled by the setup scripts.
 
+## Install From GitHub
+
+PyPI publishing is not required. Once packaging metadata is present, install the
+CLI directly from GitHub:
+
+```powershell
+pipx install git+https://github.com/tadalab-keio/figcrop.git
+```
+
+This exposes:
+
+```powershell
+figcrop help
+figcrop extract paper.pdf out --caption include
+figcrop serve
+figcrop-mcp
+```
+
+`figcrop` is the main human/agent CLI. `figcrop-mcp` is only needed when an MCP
+client should call figcrop as a registered tool instead of running shell
+commands.
+
 ## Usage
 
 `<py>` means `.venv\Scripts\python.exe` on Windows or `.venv/bin/python` on Unix.
+
+For AI agents, the shortest path is:
+
+```powershell
+<py> figtools.py extract paper.pdf out auto caption=include
+```
+
+Then inspect the JPEGs and `out/figures.json`. Do not treat a successful command
+as a successful crop until representative images have been viewed.
 
 Start the local server:
 
@@ -82,13 +113,23 @@ Useful request fields:
 One-shot CLI:
 
 ```powershell
-<py> figtools.py extract paper.pdf out auto
-<py> figtools.py extract paper.pdf out auto figs=1,2
-<py> figtools.py extract paper.pdf out_whiteband auto trim=whiteband
-<py> figtools.py extract paper.pdf out_with_captions auto caption=include
+figcrop extract paper.pdf out auto
+figcrop extract paper.pdf out auto --figs 1,2
+figcrop extract paper.pdf out auto --top 3
+figcrop extract paper.pdf out auto --panels
+figcrop extract paper.pdf out_whiteband auto --trim whiteband
+figcrop extract paper.pdf out_with_captions auto --caption include
+figcrop help
 ```
 
 Output files are JPEG crops plus a `figures.json` manifest in `out_dir`.
+
+## AI Connectors
+
+- OpenAPI/REST: start `figtools.py serve auto` and use `/openapi.json`.
+- MCP: install `requirements-mcp.txt` and run `figcrop_mcp.py`.
+
+See `CONNECTORS.md` for Claude/Codex/MCP examples and connector safety notes.
 
 ## How It Works
 
@@ -127,6 +168,14 @@ the detector bbox matters more than speed.
   class of PDF may still need review.
 - Outputs are intended for local research workflow use. Always inspect crops when
   building datasets or publications.
+
+## Agent Notes
+
+See `AGENTS.md`, `CLAUDE.md`, and `CONNECTORS.md` for machine-oriented commands,
+connector setup, verification checks, and commit attribution conventions. In
+short: prefer `caption=include` only when captions are needed, make montages for
+visual QA, and use `--force-with-lease` rather than plain `--force` if rewriting
+a pushed history.
 
 ## License
 

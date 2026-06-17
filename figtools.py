@@ -1331,7 +1331,7 @@ def serve(device="auto", port=None):
     """モデルを1回だけロードして常駐し、HTTP で図抽出要求を受ける（単発1ページを高速化）。"""
     import time
     from fastapi import FastAPI
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
     import uvicorn
     port = int(port or os.environ.get("FIG_PORT", "8077"))
     print(f"[fig-server] loading model (device={device}) ...", flush=True)
@@ -1345,17 +1345,42 @@ def serve(device="auto", port=None):
     except Exception as e:
         print("[fig-server] warmup skipped:", repr(e)[:100], flush=True)
     print(f"[fig-server] ready on {model[1]} in {time.perf_counter()-t:.1f}s", flush=True)
-    app = FastAPI()
+    app = FastAPI(
+        title="figcrop",
+        version="0.1.0",
+        description=(
+            "Extract publication figures/tables from PDFs by real Fig.N/Table N "
+            "captions. Outputs JPEG crops plus a figures.json manifest."
+        ),
+    )
 
     class Req(BaseModel):
-        pdf: str
-        out_dir: str
-        figs: list[int] | None = None           # 例 [1,2]＝その Fig 番号だけ
-        top: int | None = None                  # 例 2＝各ページ上から2図（位置基準・密ページ用）
-        panels: bool = False                    # True＝a/b/c パネル分割（既定 False＝図ごと一括）
+        pdf: str = Field(..., description="Path to the input PDF.")
+        out_dir: str = Field(..., description="Directory for JPEG crops and figures.json.")
+        figs: list[int] | None = Field(None, description="Real Fig/Table numbers to extract.")
+        top: int | None = Field(None, description="Fallback: first N visual regions per page.")
+        panels: bool = Field(False, description="Output detected regions/panels separately.")
+        trim_mode: str = Field("mask", description='"mask" default or "whiteband".')
+        caption_mode: str = Field("exclude", description='"exclude" default or "include".')
 
-        trim_mode: str = "mask"                 # mask=fast default, whiteband=local whitespace snap
-        caption_mode: str = "exclude"           # exclude=default, include=include matched caption text
+    @app.get("/")
+    def root():
+        return {
+            "name": "figcrop",
+            "openapi": "/openapi.json",
+            "health": "/health",
+            "extract": {
+                "method": "POST",
+                "path": "/extract",
+                "example": {
+                    "pdf": "paper.pdf",
+                    "out_dir": "out",
+                    "figs": [1, 2],
+                    "trim_mode": "mask",
+                    "caption_mode": "include",
+                },
+            },
+        }
 
     @app.get("/health")
     def health():
@@ -1373,30 +1398,111 @@ def serve(device="auto", port=None):
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+def _print_usage():
+    print("""figcrop: extract paper figures by real Fig.N/Table N captions
+
+Usage:
+  figcrop serve [auto|xpu|cpu|cuda|GPU]
+  figcrop extract <pdf> <out_dir> [device] [options]
+  figcrop help
+
+Common extract options:
+  --figs 1,2        Extract real figure numbers.
+  --top 3           Fallback: first N visual regions per page.
+  --panels          Output detected regions/panels separately.
+  --trim mask       Fast default trim mode.
+  --trim whiteband  Slower local whitespace snap mode.
+  --caption exclude Default: omit matched caption text.
+  --caption include Include matched caption text.
+
+Examples:
+  figcrop extract paper.pdf out auto
+  figcrop extract paper.pdf out auto --figs 1,2
+  figcrop extract paper.pdf out auto --caption include
+  figcrop extract paper.pdf out auto --trim whiteband
+
+Legacy option forms also work: figs=1,2 top=3 panels=true trim=whiteband caption=include.
+""")
+
+
+def _parse_bool(value):
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def _take_option(args, i):
+    if i + 1 >= len(args):
+        raise ValueError(f"missing value after {args[i]}")
+    return args[i + 1], i + 2
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    cmd = args[0] if args else ""
+    if cmd in ("", "-h", "--help", "help"):
+        _print_usage()
+        return 0
     if cmd == "serve":
-        serve(sys.argv[2] if len(sys.argv) > 2 else "auto")
+        serve(args[1] if len(args) > 1 else "auto")
+        return 0
     elif cmd == "extract":
-        if len(sys.argv) < 4:
-            print("usage: 図切り抜き.py extract <pdf> <out_dir> [auto|xpu|cpu] [figs=1,2]"); sys.exit(1)
-        dev = sys.argv[4] if len(sys.argv) > 4 else "auto"
+        if len(args) < 3:
+            _print_usage(); return 1
+        dev = args[3] if len(args) > 3 and not args[3].startswith("-") and "=" not in args[3] else "auto"
+        opt_start = 4 if dev != "auto" or (len(args) > 3 and args[3] == "auto") else 3
         figs = None
+        top = None
+        panels = False
         trim_mode = "mask"
         caption_mode = "exclude"
-        for arg in sys.argv[5:]:
+        i = opt_start
+        while i < len(args):
+            arg = args[i]
             if arg.startswith("figs="):
                 figs = [int(x) for x in arg[5:].split(",") if x]
+                i += 1
+            elif arg in ("--figs", "-f"):
+                value, i = _take_option(args, i)
+                figs = [int(x) for x in value.split(",") if x]
+            elif arg.startswith("top="):
+                top = int(arg.split("=", 1)[1])
+                i += 1
+            elif arg == "--top":
+                value, i = _take_option(args, i)
+                top = int(value)
+            elif arg == "panels":
+                panels = True
+                i += 1
+            elif arg in ("--panels", "--panel"):
+                panels = True
+                i += 1
+            elif arg.startswith("panels="):
+                panels = _parse_bool(arg.split("=", 1)[1])
+                i += 1
             elif arg.startswith("trim="):
                 trim_mode = arg[5:]
+                i += 1
+            elif arg == "--trim":
+                trim_mode, i = _take_option(args, i)
             elif arg.startswith("caption=") or arg.startswith("captions=") or arg.startswith("caption_mode="):
                 caption_mode = arg.split("=", 1)[1]
+                i += 1
+            elif arg in ("--caption", "--captions", "--caption-mode"):
+                caption_mode, i = _take_option(args, i)
             elif arg in ("mask", "whiteband", "white", "white_band", "band"):
                 trim_mode = arg
+                i += 1
             elif arg in ("caption", "captions", "with_caption", "with_captions", "include_caption", "include_captions"):
                 caption_mode = "include"
+                i += 1
             else:
                 figs = [int(x) for x in arg.split(",") if x]
-        extract(sys.argv[2], sys.argv[3], dev, figs=figs, trim_mode=trim_mode, caption_mode=caption_mode)
+                i += 1
+        extract(args[1], args[2], dev, figs=figs, top=top, panels=panels,
+                trim_mode=trim_mode, caption_mode=caption_mode)
+        return 0
     else:
-        print("usage: 図切り抜き.py serve|extract …  （①手動クロップ関数は主環境で import して使用）")
+        _print_usage(); return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

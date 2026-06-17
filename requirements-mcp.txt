@@ -1,0 +1,3 @@
+# Optional MCP connector dependencies.
+# Install after the base environment when you want to expose figcrop as an MCP tool.
+mcp>=1.0
