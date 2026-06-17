@@ -46,12 +46,15 @@ unless you intentionally expose it through a secure tunnel or hosted deployment.
 
 ## MCP
 
-If installed with pipx from GitHub, the MCP command is available directly:
+If installed with pipx from PyPI, the MCP command is available directly:
 
 ```powershell
-pipx install git+https://github.com/tadalab-keio/figcrop.git
+pipx install figcrop
 figcrop-mcp
 ```
+
+For unreleased GitHub source, use
+`pipx install git+https://github.com/tadalab-keio/figcrop.git`.
 
 For a source checkout created with `setup.ps1` / `setup.sh`, install the optional
 MCP dependency:

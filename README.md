@@ -50,13 +50,12 @@ bash setup.sh
 `requirements.txt` is a manifest for the base packages. Device-specific torch
 packages are handled by the setup scripts.
 
-## Install From GitHub
+## Install
 
-PyPI publishing is not required. Once packaging metadata is present, install the
-CLI directly from GitHub:
+Install the released CLI from PyPI:
 
 ```powershell
-pipx install git+https://github.com/tadalab-keio/figcrop.git
+pipx install figcrop
 ```
 
 This exposes:
@@ -71,6 +70,12 @@ figcrop-mcp
 `figcrop` is the main human/agent CLI. `figcrop-mcp` is only needed when an MCP
 client should call figcrop as a registered tool instead of running shell
 commands.
+
+To install directly from the current GitHub source instead:
+
+```powershell
+pipx install git+https://github.com/tadalab-keio/figcrop.git
+```
 
 ## Usage
 

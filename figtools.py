@@ -1347,7 +1347,7 @@ def serve(device="auto", port=None):
     print(f"[fig-server] ready on {model[1]} in {time.perf_counter()-t:.1f}s", flush=True)
     app = FastAPI(
         title="figcrop",
-        version="0.1.0",
+        version="0.1.1",
         description=(
             "Extract publication figures/tables from PDFs by real Fig.N/Table N "
             "captions. Outputs JPEG crops plus a figures.json manifest."
