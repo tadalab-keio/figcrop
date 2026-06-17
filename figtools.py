@@ -1032,6 +1032,99 @@ def _whole_figures(region_bbs, assign):
     return out
 
 
+def _gutter_between(gray, scale, axis, lo, hi, span0, span1):
+    """Return the whitest rendered gutter between two label anchors."""
+    if gray is None or hi <= lo:
+        return (lo + hi) / 2.0
+    import numpy as np
+    H, W = gray.shape
+    plo = max(0, int(round(lo * scale)))
+    phi = min(W if axis == "x" else H, int(round(hi * scale)))
+    if phi <= plo:
+        return (lo + hi) / 2.0
+    s0 = max(0, int(round(span0 * scale)))
+    s1 = min(H if axis == "x" else W, int(round(span1 * scale)))
+    if s1 <= s0:
+        return (lo + hi) / 2.0
+    dark = gray < 90
+    ink = gray < 245
+    mid = (plo + phi) / 2.0
+
+    def score(pos):
+        if axis == "x":
+            a = max(0, pos - 1)
+            b = min(W, pos + 2)
+            dark_n = int(dark[s0:s1, a:b].sum())
+            ink_n = int(ink[s0:s1, a:b].sum())
+        else:
+            a = max(0, pos - 1)
+            b = min(H, pos + 2)
+            dark_n = int(dark[a:b, s0:s1].sum())
+            ink_n = int(ink[a:b, s0:s1].sum())
+        return (dark_n, ink_n, abs(pos - mid))
+
+    return min(range(plo, phi + 1), key=score) / scale
+
+
+def _subpanel_boxes(fig_bb, plabels, gray=None, scale=1.0):
+    """Infer labeled subpanel boxes inside a whole-figure bbox.
+
+    This is intentionally label-driven: it is for figures where the layout model
+    sees one large visual region but the PDF text layer still exposes (a)/(b)
+    labels. Boundaries are estimated from neighboring label anchors, then the
+    normal trim pass tightens each crop.
+    """
+    fx0, fy0, fx1, fy1 = fig_bb
+    fw, fh = max(1.0, fx1 - fx0), max(1.0, fy1 - fy0)
+    labels = []
+    for bb, lab in plabels:
+        px0, py0, px1, py1 = bb
+        cx, cy = (px0 + px1) / 2.0, (py0 + py1) / 2.0
+        if fx0 - 8 <= cx <= fx1 + 8 and fy0 - 8 <= cy <= fy1 + 8:
+            labels.append((bb, lab, cx, cy))
+    if len(labels) < 2:
+        return []
+
+    labels.sort(key=lambda x: (x[3], x[2]))
+    row_tol = max(8.0, min(28.0, 0.10 * fh))
+    rows = []
+    for item in labels:
+        if not rows or abs(item[3] - rows[-1]["cy"]) > row_tol:
+            rows.append({"items": [item], "cy": item[3]})
+        else:
+            row = rows[-1]
+            row["items"].append(item)
+            row["cy"] = sum(x[3] for x in row["items"]) / len(row["items"])
+
+    row_tops = [max(fy0, min(x[0][1] for x in row["items"]) - 2.0) for row in rows]
+    y_bounds = [fy0]
+    for i in range(1, len(rows)):
+        prev_cy, cur_cy = rows[i - 1]["cy"], rows[i]["cy"]
+        gut = _gutter_between(gray, scale, "y", prev_cy, cur_cy, fx0, fx1)
+        y_bounds.append(max(y_bounds[-1] + 4.0, min(fy1, gut)))
+    y_bounds.append(fy1)
+
+    out = []
+    seen = {}
+    for r, row in enumerate(rows):
+        items = sorted(row["items"], key=lambda x: x[2])
+        top = min(y_bounds[r], row_tops[r])
+        bottom = y_bounds[r + 1]
+        x_bounds = [fx0]
+        for i in range(1, len(items)):
+            gut = _gutter_between(gray, scale, "x", items[i - 1][2], items[i][2], top, bottom)
+            x_bounds.append(max(x_bounds[-1] + 4.0, min(fx1, gut)))
+        x_bounds.append(fx1)
+        for i, (bb, lab, _cx, _cy) in enumerate(items):
+            left, right = x_bounds[i], x_bounds[i + 1]
+            if right - left < 8.0 or bottom - top < 8.0:
+                continue
+            seen[lab] = seen.get(lab, 0) + 1
+            suffix = lab if seen[lab] == 1 else f"{lab}{seen[lab]}"
+            out.append((suffix, (left, top, right, bottom), bb))
+    return out
+
+
 def _caption_cell_for_region(region_bb, caps, drawing_bbs, page_rect):
     """Return a slide/poster cell above a caption inside a giant detector region."""
     rx0, ry0, rx1, ry1 = region_bb
@@ -1073,14 +1166,30 @@ def _normalize_caption_mode(mode):
     raise ValueError(f"unknown caption_mode: {mode}")
 
 
+def _normalize_output_mode(mode, panels=False, caption_mode="exclude"):
+    if mode is None:
+        if panels:
+            return "panel"
+        return "caption" if _normalize_caption_mode(caption_mode) == "include" else "figure"
+    mode = str(mode or "figure").lower().replace("-", "_")
+    if mode in ("figure", "fig", "whole", "full", "all", "exclude", "no_caption", "no_captions"):
+        return "figure"
+    if mode in ("panel", "panels", "subpanel", "subpanels", "part", "parts"):
+        return "panel"
+    if mode in ("caption", "captions", "with_caption", "with_captions", "include_caption", "include_captions"):
+        return "caption"
+    raise ValueError(f"unknown mode: {mode}")
+
+
 def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False,
-            trim_mode="mask", caption_mode="exclude"):
+            trim_mode="mask", caption_mode="exclude", mode=None):
     """論文PDFから図を切り出す。**既定＝図ごとに一括（全パネル＋間のテキスト込みで1枚）**。
-      （既定 None,None,False）… 各 Fig.N を1枚に（所属領域の外接矩形）。番号不明領域は x##。
-      panels=True … a/b/c… パネル単位に分割（各領域を個別切出・パネル記号で命名）。
+      mode="figure"  … 各 Fig.N を図本体だけ1枚に（所属領域の外接矩形）。番号不明領域は x##。
+      mode="panel"   … 図本体だけを (a)/(b)… パネル単位に分割。
+      mode="caption" … 各 Fig.N を図本体＋対応キャプションで1枚に。
       figs=[1,2]  … その Fig 番号だけ（一括/分割どちらにも効く）。Fig5 始まりページでも実番号で当たる。
       top=2       … 各ページ上から2領域（位置基準・密ページ用フォールバック）。
-      caption_mode="include" … 対応するキャプション行も含めて切り出す。
+      panels=True / caption_mode="include" は旧CLI/API互換で mode に正規化される。
     番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（PDFテキスト層・MinerU非依存）。"""
     import fitz
     m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
@@ -1089,7 +1198,8 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         trim_mode = "whiteband"
     if trim_mode not in ("mask", "whiteband"):
         raise ValueError(f"unknown trim_mode: {trim_mode}")
-    caption_mode = _normalize_caption_mode(caption_mode)
+    output_mode = _normalize_output_mode(mode, panels=panels, caption_mode=caption_mode)
+    caption_mode = "include" if output_mode == "caption" else "exclude"
     os.makedirs(out_dir, exist_ok=True)
     want = set(figs) if figs else None
     doc = fitz.open(pdf_path)
@@ -1277,35 +1387,74 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         if top:                                                    # ── 位置基準（領域ごと）
             for k, d in enumerate(regions[:top], 1):
                 _crop(region_bbs[k - 1], f"fig_p{pno+1:02d}_top{k:02d}_{d['label']}.jpg",
-                      fig=None, label=d["label"])
+                      fig=None, label=d["label"], mode=output_mode)
             continue
-        if panels:                                                 # ── a/b/c パネル分割（領域ごと）
-            seen = {}
-            for i, d in enumerate(regions):
-                num = assign.get(i)
-                if (want is not None and num not in want) or (num is None and want is not None):
+        wholes = _whole_figures(region_bbs, assign)
+        if output_mode == "panel":                                 # ── (a)/(b)… パネル分割
+            import numpy as np
+            det_gray = np.asarray(img.convert("L"))
+            for num in sorted(wholes):
+                if want is not None and num not in want:
                     continue
-                if num is not None:
-                    pl = _panel_of(region_bbs[i], plabels)
+                assigned_regions = [(i, d, _panel_of(region_bbs[i], plabels))
+                                    for i, d in enumerate(regions) if assign.get(i) == num]
+                seen = {}
+                if sum(1 for _i, _d, pl in assigned_regions if pl) >= 2:
+                    emitted = set()
+                    for i, d, pl in assigned_regions:
+                        rboxes = _subpanel_boxes(region_bbs[i], plabels, det_gray, DET_DPI / 72.0)
+                        if len(rboxes) >= 2:
+                            for panel, pbb, _label_bb in rboxes:
+                                if panel in emitted:
+                                    continue
+                                emitted.add(panel)
+                                _crop(pbb, f"fig_p{pno+1:02d}_Fig{num}_{panel}.jpg",
+                                      cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
+                                      label="panel", panel=panel, mode=output_mode)
+                            continue
+                        if not pl or pl in emitted:
+                            continue
+                        emitted.add(pl)
+                        base = f"Fig{num}_{pl}"
+                        seen[base] = seen.get(base, 0) + 1
+                        tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
+                        _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
+                              cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
+                              label=d["label"], panel=pl, mode=output_mode)
+                    continue
+
+                boxes = _subpanel_boxes(wholes[num], plabels, det_gray, DET_DPI / 72.0)
+                if boxes:
+                    for panel, pbb, _label_bb in boxes:
+                        _crop(pbb, f"fig_p{pno+1:02d}_Fig{num}_{panel}.jpg",
+                              cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
+                              label="panel", panel=panel, mode=output_mode)
+                    continue
+
+                for i, d, pl in assigned_regions:
                     base = f"Fig{num}_{pl}" if pl else f"Fig{num}_{d['label']}"
-                else:
-                    base = f"x_{d['label']}"
-                seen[base] = seen.get(base, 0) + 1
-                tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
-                _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
-                      cap_bbs=cap_map.get(num, ()) if num is not None else (),
-                      include_cap_bbs=cap_extent_map.get(num, ()) if num is not None else (),
-                      fig=(f"Fig{num}" if num is not None else None), label=d["label"])
+                    seen[base] = seen.get(base, 0) + 1
+                    tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
+                    _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
+                          cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
+                          label=d["label"], panel=pl, mode=output_mode)
+            if want is None:
+                xn = 0
+                for i, d in enumerate(regions):
+                    if i in assign:
+                        continue
+                    xn += 1
+                    _crop(region_bbs[i], f"fig_p{pno+1:02d}_x{xn:02d}_{d['label']}.jpg",
+                          fig=None, label=d["label"], mode=output_mode)
             continue
         # ── 既定：図ごとに一括（全体）
-        wholes = _whole_figures(region_bbs, assign)
         for num in sorted(wholes):
             if want is not None and num not in want:
                 continue
             _crop(wholes[num], f"fig_p{pno+1:02d}_Fig{num}.jpg",
                   cap_bbs=cap_map.get(num, ()),
                   include_cap_bbs=cap_extent_map.get(num, ()),
-                  fig=f"Fig{num}", label="figure")
+                  fig=f"Fig{num}", label="figure", mode=output_mode)
         if want is None:                                           # 番号に属さない領域は個別フォールバック
             xn = 0
             for i, d in enumerate(regions):
@@ -1316,7 +1465,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                         continue
                     xn += 1
                     _crop(bb, f"fig_p{pno+1:02d}_x{xn:02d}_{d['label']}.jpg",
-                          fig=None, label=d["label"])
+                          fig=None, label=d["label"], mode=output_mode)
     json.dump(manifest, open(os.path.join(out_dir, "figures.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
     print(f"device={dev}  pages={len(doc)}  figures={len(manifest)}"
@@ -1347,7 +1496,7 @@ def serve(device="auto", port=None):
     print(f"[fig-server] ready on {model[1]} in {time.perf_counter()-t:.1f}s", flush=True)
     app = FastAPI(
         title="figcrop",
-        version="0.1.1",
+        version="0.2.0",
         description=(
             "Extract publication figures/tables from PDFs by real Fig.N/Table N "
             "captions. Outputs JPEG crops plus a figures.json manifest."
@@ -1359,9 +1508,10 @@ def serve(device="auto", port=None):
         out_dir: str = Field(..., description="Directory for JPEG crops and figures.json.")
         figs: list[int] | None = Field(None, description="Real Fig/Table numbers to extract.")
         top: int | None = Field(None, description="Fallback: first N visual regions per page.")
-        panels: bool = Field(False, description="Output detected regions/panels separately.")
+        mode: str | None = Field(None, description='"figure" default, "panel", or "caption".')
+        panels: bool = Field(False, description='Legacy alias for mode="panel".')
         trim_mode: str = Field("mask", description='"mask" default or "whiteband".')
-        caption_mode: str = Field("exclude", description='"exclude" default or "include".')
+        caption_mode: str = Field("exclude", description='Legacy alias: "include" means mode="caption".')
 
     @app.get("/")
     def root():
@@ -1376,8 +1526,8 @@ def serve(device="auto", port=None):
                     "pdf": "paper.pdf",
                     "out_dir": "out",
                     "figs": [1, 2],
+                    "mode": "caption",
                     "trim_mode": "mask",
-                    "caption_mode": "include",
                 },
             },
         }
@@ -1391,7 +1541,8 @@ def serve(device="auto", port=None):
         import time as _t
         s = _t.perf_counter()
         man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top,
-                      panels=r.panels, trim_mode=r.trim_mode, caption_mode=r.caption_mode)
+                      panels=r.panels, trim_mode=r.trim_mode,
+                      caption_mode=r.caption_mode, mode=r.mode)
         return {"device": model[1], "elapsed_s": round(_t.perf_counter() - s, 3),
                 "n": len(man), "figures": man}
 
@@ -1409,16 +1560,17 @@ Usage:
 Common extract options:
   --figs 1,2        Extract real figure numbers.
   --top 3           Fallback: first N visual regions per page.
-  --panels          Output detected regions/panels separately.
+  --mode figure     Default: whole figure body, no caption.
+  --mode panel      Split each whole figure into (a)/(b) subpanels.
+  --mode caption    Whole figure body plus matched caption text.
   --trim mask       Fast default trim mode.
   --trim whiteband  Slower local whitespace snap mode.
-  --caption exclude Default: omit matched caption text.
-  --caption include Include matched caption text.
 
 Examples:
   figcrop extract paper.pdf out auto
   figcrop extract paper.pdf out auto --figs 1,2
-  figcrop extract paper.pdf out auto --caption include
+  figcrop extract paper.pdf out auto --mode panel
+  figcrop extract paper.pdf out auto --mode caption
   figcrop extract paper.pdf out auto --trim whiteband
 
 Legacy option forms also work: figs=1,2 top=3 panels=true trim=whiteband caption=include.
@@ -1454,6 +1606,7 @@ def main(argv=None):
         panels = False
         trim_mode = "mask"
         caption_mode = "exclude"
+        mode = None
         i = opt_start
         while i < len(args):
             arg = args[i]
@@ -1471,13 +1624,22 @@ def main(argv=None):
                 top = int(value)
             elif arg == "panels":
                 panels = True
+                mode = "panel"
                 i += 1
             elif arg in ("--panels", "--panel"):
                 panels = True
+                mode = "panel"
                 i += 1
             elif arg.startswith("panels="):
                 panels = _parse_bool(arg.split("=", 1)[1])
+                if panels:
+                    mode = "panel"
                 i += 1
+            elif arg.startswith("mode="):
+                mode = arg.split("=", 1)[1]
+                i += 1
+            elif arg == "--mode":
+                mode, i = _take_option(args, i)
             elif arg.startswith("trim="):
                 trim_mode = arg[5:]
                 i += 1
@@ -1485,20 +1647,29 @@ def main(argv=None):
                 trim_mode, i = _take_option(args, i)
             elif arg.startswith("caption=") or arg.startswith("captions=") or arg.startswith("caption_mode="):
                 caption_mode = arg.split("=", 1)[1]
+                if _normalize_caption_mode(caption_mode) == "include":
+                    mode = "caption"
                 i += 1
             elif arg in ("--caption", "--captions", "--caption-mode"):
                 caption_mode, i = _take_option(args, i)
+                if _normalize_caption_mode(caption_mode) == "include":
+                    mode = "caption"
             elif arg in ("mask", "whiteband", "white", "white_band", "band"):
                 trim_mode = arg
                 i += 1
             elif arg in ("caption", "captions", "with_caption", "with_captions", "include_caption", "include_captions"):
                 caption_mode = "include"
+                mode = "caption"
+                i += 1
+            elif arg in ("panel", "subpanel", "subpanels"):
+                panels = True
+                mode = "panel"
                 i += 1
             else:
                 figs = [int(x) for x in arg.split(",") if x]
                 i += 1
         extract(args[1], args[2], dev, figs=figs, top=top, panels=panels,
-                trim_mode=trim_mode, caption_mode=caption_mode)
+                trim_mode=trim_mode, caption_mode=caption_mode, mode=mode)
         return 0
     else:
         _print_usage(); return 1

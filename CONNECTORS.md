@@ -28,7 +28,7 @@ Extraction request:
 ```bash
 curl -s -X POST http://127.0.0.1:8077/extract \
   -H "Content-Type: application/json" \
-  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2],"caption_mode":"include"}'
+  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2],"mode":"caption"}'
 ```
 
 Important request fields:
@@ -37,9 +37,10 @@ Important request fields:
 - `out_dir`: output directory for JPEG crops and `figures.json`
 - `figs`: optional real figure numbers
 - `top`: optional positional fallback
-- `panels`: output panels/regions separately
+- `mode`: `figure`, `panel`, or `caption`
+- `panels`: legacy alias for `mode=panel`
 - `trim_mode`: `mask` or `whiteband`
-- `caption_mode`: `exclude` or `include`
+- `caption_mode`: legacy alias; `include` means `mode=caption`
 
 The server is local by default (`127.0.0.1`). Remote AI products cannot call it
 unless you intentionally expose it through a secure tunnel or hosted deployment.
@@ -77,9 +78,10 @@ The MCP tool is named `extract_figures` and accepts:
   "out_dir": "out",
   "figs": [1, 2],
   "top": null,
+  "mode": "panel",
   "panels": false,
   "trim_mode": "mask",
-  "caption_mode": "include",
+  "caption_mode": "exclude",
   "device": "auto"
 }
 ```
@@ -117,4 +119,4 @@ images. Recommended flow:
 2. Read `figures.json`.
 3. Create or open a montage of JPEGs.
 4. Check for clipped axes/captions and neighbor frame lines.
-5. Retry with `figs=`, `top=`, `panels=true`, or `trim=whiteband` if needed.
+5. Retry with `figs=`, `top=`, `mode=panel`, or `trim=whiteband` if needed.

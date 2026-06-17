@@ -13,8 +13,11 @@ papers where simple heuristic tools often miss figures or split panels badly.
   number found in the PDF text layer.
 - Keep figure-internal labels, process-flow text, axes, table borders, and panels,
   while excluding the caption line.
-- Optionally include the matched caption text in the crop with
-  `caption_mode: "include"`.
+- Output modes:
+  - `figure` default: whole figure body, no caption.
+  - `panel`: split figures into `(a)` / `(b)` subpanels when panel labels are
+    available.
+  - `caption`: whole figure body plus the matched caption text.
 - Run as a persistent local HTTP server so the layout model is loaded once.
 - Use OpenVINO by default for fast local inference; torch backends remain available.
 - Trim modes:
@@ -62,7 +65,7 @@ This exposes:
 
 ```powershell
 figcrop help
-figcrop extract paper.pdf out --caption include
+figcrop extract paper.pdf out --mode caption
 figcrop serve
 figcrop-mcp
 ```
@@ -84,7 +87,7 @@ pipx install git+https://github.com/tadalab-keio/figcrop.git
 For AI agents, the shortest path is:
 
 ```powershell
-<py> figtools.py extract paper.pdf out auto caption=include
+<py> figtools.py extract paper.pdf out auto --mode figure
 ```
 
 Then inspect the JPEGs and `out/figures.json`. Do not treat a successful command
@@ -101,7 +104,7 @@ Then request crops:
 ```bash
 curl -s -X POST http://127.0.0.1:8077/extract \
   -H "Content-Type: application/json" \
-  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2]}'
+  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2],"mode":"caption"}'
 ```
 
 Useful request fields:
@@ -109,11 +112,11 @@ Useful request fields:
 - `figs`: real figure numbers to extract, for example `[1,2]`.
 - `top`: fallback positional extraction, for example `2` for the first two visual
   regions per page.
-- `panels`: `true` to output detected panels/regions separately instead of whole
-  figures.
+- `mode`: `"figure"` default, `"panel"` for `(a)` / `(b)` subpanels, or
+  `"caption"` for whole figure plus matched caption text.
+- `panels`: legacy alias for `mode: "panel"`.
 - `trim_mode`: `"mask"` default or `"whiteband"`.
-- `caption_mode`: `"exclude"` default or `"include"` to include the matched
-  caption text below the figure.
+- `caption_mode`: legacy alias; `"include"` means `mode: "caption"`.
 
 One-shot CLI:
 
@@ -121,9 +124,9 @@ One-shot CLI:
 figcrop extract paper.pdf out auto
 figcrop extract paper.pdf out auto --figs 1,2
 figcrop extract paper.pdf out auto --top 3
-figcrop extract paper.pdf out auto --panels
+figcrop extract paper.pdf out_panels auto --mode panel
 figcrop extract paper.pdf out_whiteband auto --trim whiteband
-figcrop extract paper.pdf out_with_captions auto --caption include
+figcrop extract paper.pdf out_with_captions auto --mode caption
 figcrop help
 ```
 
@@ -144,8 +147,9 @@ See `CONNECTORS.md` for Claude/Codex/MCP examples and connector safety notes.
 4. Read `Fig.N` / `Table N` captions directly from the PDF text layer.
 5. Assign each region to the nearest same-column caption below it.
 6. Union regions with the same figure number into one whole-figure crop.
-7. If requested, extend the crop to the matched caption paragraph.
-8. Render the page at 300 dpi and crop with the selected trim mode.
+7. In `panel` mode, split whole-figure boxes using `(a)` / `(b)` label anchors.
+8. In `caption` mode, extend the crop to the matched caption paragraph.
+9. Render the page at 300 dpi and crop with the selected trim mode.
 
 The numbering and whole-figure grouping are local geometry logic, not MinerU's
 full reading-order pipeline.
@@ -167,7 +171,7 @@ the detector bbox matters more than speed.
 ## Limitations
 
 - Very dense pages can still confuse region-to-caption assignment. Use `top=` or
-  `panels=true` as fallbacks.
+  `mode=panel` as fallbacks.
 - Some PDFs contain slide/poster grids or decorative page furniture that can look
   like a large table. figcrop has a local-cell fallback for common cases, but this
   class of PDF may still need review.
@@ -178,9 +182,9 @@ the detector bbox matters more than speed.
 
 See `AGENTS.md`, `CLAUDE.md`, and `CONNECTORS.md` for machine-oriented commands,
 connector setup, verification checks, and commit attribution conventions. In
-short: prefer `caption=include` only when captions are needed, make montages for
-visual QA, and use `--force-with-lease` rather than plain `--force` if rewriting
-a pushed history.
+short: choose exactly one output mode (`figure`, `panel`, or `caption`), make
+montages for visual QA, and use `--force-with-lease` rather than plain `--force`
+if rewriting a pushed history.
 
 ## License
 

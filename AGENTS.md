@@ -18,7 +18,8 @@ Windows:
 ```powershell
 .\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto
 .\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto figs=1,2
-.\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto caption=include
+.\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto mode=panel
+.\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto mode=caption
 .\.venv\Scripts\python.exe figtools.py extract paper.pdf out auto trim=whiteband
 .\.venv\Scripts\python.exe figtools.py serve auto
 ```
@@ -35,17 +36,20 @@ HTTP server request:
 ```bash
 curl -s -X POST http://127.0.0.1:8077/extract \
   -H "Content-Type: application/json" \
-  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2],"caption_mode":"include"}'
+  -d '{"pdf":"paper.pdf","out_dir":"out","figs":[1,2],"mode":"caption"}'
 ```
 
 ## Extraction Options
 
 - `figs=1,2`: extract real figure numbers found from PDF text captions.
 - `top=N`: fallback to the first N visual regions per page.
-- `panels=true`: output detected regions/panels separately.
+- `mode=figure`: default, whole figure body without caption.
+- `mode=panel`: split each figure into `(a)` / `(b)` subpanels.
+- `mode=caption`: whole figure body plus matched caption text.
 - `trim=mask`: default fast trim mode.
 - `trim=whiteband`: slower local whitespace snap around the detector bbox.
-- `caption=include`: include the matched caption text below the figure.
+- `panels=true` and `caption=include` are legacy aliases for `mode=panel` and
+  `mode=caption`.
 
 ## Verification
 
@@ -55,7 +59,7 @@ Always inspect JPEG outputs, not just command success. At minimum:
 2. Check for cut-off axes, table borders, panel labels, and caption text.
 3. Check for neighbor figure/table frame lines, section headings, or unrelated
    fallback regions.
-4. For `caption=include`, check that the caption is complete and that nearby
+4. For `mode=caption`, check that the caption is complete and that nearby
    frame rules were not included.
 5. Run `python -m py_compile figtools.py` after code changes.
 
@@ -70,9 +74,9 @@ logic.
   detector resolution.
 - Numbering is local logic: PDF text captions are matched to nearby visual
   regions. It is not MinerU's full reading-order pipeline.
-- Default output is one crop per `Fig.N`; `panels=true` opts into region-level
-  output.
-- `caption=include` first trims the figure body, then unions it with a tight
+- Default output is one crop per `Fig.N`; `mode=panel` opts into `(a)` / `(b)`
+  subpanel output.
+- `mode=caption` first trims the figure body, then unions it with a tight
   caption text-ink rectangle from the PDF text block. Long horizontal/vertical
   caption-adjacent rules are ignored for the caption bbox.
 - Very dense pages can still need `figs=`, `top=`, or manual review.

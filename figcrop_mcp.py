@@ -40,6 +40,7 @@ def extract_figures(
     out_dir: str,
     figs: list[int] | None = None,
     top: int | None = None,
+    mode: str = "figure",
     panels: bool = False,
     trim_mode: str = "mask",
     caption_mode: str = "exclude",
@@ -52,9 +53,10 @@ def extract_figures(
         out_dir: Directory where JPEG crops and figures.json will be written.
         figs: Optional real Fig/Table numbers to extract.
         top: Optional positional fallback: first N visual regions per page.
-        panels: Output detected regions/panels separately instead of whole figures.
+        mode: "figure" (default), "panel", or "caption".
+        panels: Legacy alias for mode="panel".
         trim_mode: "mask" (default) or "whiteband".
-        caption_mode: "exclude" (default) or "include".
+        caption_mode: Legacy alias; "include" means mode="caption".
         device: Layout backend/device, usually "auto".
     """
     manifest = figtools.extract(
@@ -66,6 +68,7 @@ def extract_figures(
         panels=panels,
         trim_mode=trim_mode,
         caption_mode=caption_mode,
+        mode=mode,
     )
     clean_out = out_dir.rstrip("/\\")
     return {
