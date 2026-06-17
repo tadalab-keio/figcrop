@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import figtools
+import figcrop
 
 
 try:
@@ -30,7 +30,7 @@ _MODEL_CACHE: dict[str, tuple[Any, str]] = {}
 def _model(device: str) -> tuple[Any, str]:
     key = device or "auto"
     if key not in _MODEL_CACHE:
-        _MODEL_CACHE[key] = figtools._engine(key)
+        _MODEL_CACHE[key] = figcrop._engine(key)
     return _MODEL_CACHE[key]
 
 
@@ -59,7 +59,7 @@ def extract_figures(
         caption_mode: Legacy alias; "include" means mode="caption".
         device: Layout backend/device, usually "auto".
     """
-    manifest = figtools.extract(
+    manifest = figcrop.extract(
         pdf,
         out_dir,
         model=_model(device),

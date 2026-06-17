@@ -1,4 +1,2 @@
-include AGENTS.md
-include CLAUDE.md
 include CONNECTORS.md
 include requirements-mcp.txt

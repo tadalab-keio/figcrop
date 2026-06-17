@@ -87,7 +87,7 @@ pipx install git+https://github.com/tadalab-keio/figcrop.git
 For AI agents, the shortest path is:
 
 ```powershell
-<py> figtools.py extract paper.pdf out auto --mode figure
+<py> figcrop.py extract paper.pdf out auto --mode figure
 ```
 
 Then inspect the JPEGs and `out/figures.json`. Do not treat a successful command
@@ -96,7 +96,7 @@ as a successful crop until representative images have been viewed.
 Start the local server:
 
 ```powershell
-<py> figtools.py serve auto
+<py> figcrop.py serve auto
 ```
 
 Then request crops:
@@ -134,7 +134,7 @@ Output files are JPEG crops plus a `figures.json` manifest in `out_dir`.
 
 ## AI Connectors
 
-- OpenAPI/REST: start `figtools.py serve auto` and use `/openapi.json`.
+- OpenAPI/REST: start `figcrop.py serve auto` and use `/openapi.json`.
 - MCP: install `requirements-mcp.txt` and run `figcrop_mcp.py`.
 
 See `CONNECTORS.md` for Claude/Codex/MCP examples and connector safety notes.
@@ -170,21 +170,15 @@ the detector bbox matters more than speed.
 
 ## Limitations
 
-- Very dense pages can still confuse region-to-caption assignment. Use `top=` or
-  `mode=panel` as fallbacks.
+- Very dense pages can still confuse region-to-caption assignment. Use `top=` as
+  a fallback.
+- `mode=panel` only emits figures that have a clean `(a)`, `(b)`, ... sequence.
+  Figures without panel labels are intentionally skipped.
 - Some PDFs contain slide/poster grids or decorative page furniture that can look
   like a large table. figcrop has a local-cell fallback for common cases, but this
   class of PDF may still need review.
 - Outputs are intended for local research workflow use. Always inspect crops when
   building datasets or publications.
-
-## Agent Notes
-
-See `AGENTS.md`, `CLAUDE.md`, and `CONNECTORS.md` for machine-oriented commands,
-connector setup, verification checks, and commit attribution conventions. In
-short: choose exactly one output mode (`figure`, `panel`, or `caption`), make
-montages for visual QA, and use `--force-with-lease` rather than plain `--force`
-if rewriting a pushed history.
 
 ## License
 

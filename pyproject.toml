@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "figcrop"
-version = "0.2.0"
+version = "0.2.1"
 description = "High-quality figure extraction from dense research-paper PDFs"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -43,8 +43,8 @@ Repository = "https://github.com/tadalab-keio/figcrop"
 Issues = "https://github.com/tadalab-keio/figcrop/issues"
 
 [project.scripts]
-figcrop = "figtools:main"
+figcrop = "figcrop:main"
 figcrop-mcp = "figcrop_mcp:main"
 
 [tool.setuptools]
-py-modules = ["figtools", "figcrop_mcp"]
+py-modules = ["figcrop", "figtools", "figcrop_mcp"]

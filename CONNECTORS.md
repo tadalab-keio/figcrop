@@ -14,7 +14,7 @@ PDF files.
 Start the server:
 
 ```powershell
-.\.venv\Scripts\python.exe figtools.py serve auto
+.\.venv\Scripts\python.exe figcrop.py serve auto
 ```
 
 Discovery endpoints:
