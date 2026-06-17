@@ -13,6 +13,8 @@ papers where simple heuristic tools often miss figures or split panels badly.
   number found in the PDF text layer.
 - Keep figure-internal labels, process-flow text, axes, table borders, and panels,
   while excluding the caption line.
+- Optionally include the matched caption text in the crop with
+  `caption_mode: "include"`.
 - Run as a persistent local HTTP server so the layout model is loaded once.
 - Use OpenVINO by default for fast local inference; torch backends remain available.
 - Trim modes:
@@ -74,6 +76,8 @@ Useful request fields:
 - `panels`: `true` to output detected panels/regions separately instead of whole
   figures.
 - `trim_mode`: `"mask"` default or `"whiteband"`.
+- `caption_mode`: `"exclude"` default or `"include"` to include the matched
+  caption text below the figure.
 
 One-shot CLI:
 
@@ -81,6 +85,7 @@ One-shot CLI:
 <py> figtools.py extract paper.pdf out auto
 <py> figtools.py extract paper.pdf out auto figs=1,2
 <py> figtools.py extract paper.pdf out_whiteband auto trim=whiteband
+<py> figtools.py extract paper.pdf out_with_captions auto caption=include
 ```
 
 Output files are JPEG crops plus a `figures.json` manifest in `out_dir`.
@@ -93,7 +98,8 @@ Output files are JPEG crops plus a `figures.json` manifest in `out_dir`.
 4. Read `Fig.N` / `Table N` captions directly from the PDF text layer.
 5. Assign each region to the nearest same-column caption below it.
 6. Union regions with the same figure number into one whole-figure crop.
-7. Render the page at 300 dpi and crop with the selected trim mode.
+7. If requested, extend the crop to the matched caption paragraph.
+8. Render the page at 300 dpi and crop with the selected trim mode.
 
 The numbering and whole-figure grouping are local geometry logic, not MinerU's
 full reading-order pipeline.

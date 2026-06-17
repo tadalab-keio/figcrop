@@ -410,6 +410,46 @@ def _text_captions(page):
     return out
 
 
+def _caption_extents(page):
+    """Return caption paragraph boxes, staying inside the PDF text block."""
+    out = {}
+    for b in page.get_text("dict").get("blocks", []):
+        lines = []
+        for ln in b.get("lines", []):
+            sp = ln.get("spans", [])
+            if not sp:
+                continue
+            txt = "".join(s["text"] for s in sp).strip()
+            if not txt:
+                continue
+            bb = (min(s["bbox"][0] for s in sp), min(s["bbox"][1] for s in sp),
+                  max(s["bbox"][2] for s in sp), max(s["bbox"][3] for s in sp))
+            lines.append((txt, bb))
+        for i, (txt, cbb) in enumerate(lines):
+            mm = CAP_RE.match(txt)
+            if not mm:
+                continue
+            num = int(mm.group(2))
+            extent = cbb
+            prev_y1 = cbb[3]
+            prev_h = max(1.0, cbb[3] - cbb[1])
+            left_tol = max(4.0, 0.04 * max(1.0, cbb[2] - cbb[0]))
+            for ntxt, bb in lines[i + 1:i + 9]:
+                if CAP_RE.match(ntxt):
+                    break
+                if bb[1] - prev_y1 > max(3.0, 0.8 * prev_h):
+                    break
+                if abs(bb[0] - cbb[0]) > left_tol:
+                    continue
+                if bb[2] > max(cbb[2], extent[2]) + 45.0:
+                    continue
+                extent = _union(extent, bb)
+                prev_y1 = max(prev_y1, bb[3])
+                prev_h = max(1.0, bb[3] - bb[1])
+            out.setdefault(num, []).append(extent)
+    return out
+
+
 def _panel_labels(page):
     """テキスト層から (a)..(h) のパネル記号を位置つきで拾う。返り値 [(bbox_pt, 'a'), ...]。"""
     out = []
@@ -877,6 +917,46 @@ def _caption_guard_bottom_px(full_img, gray_ref, crop_box, fig_bb, cap_bbs, scal
     return guard
 
 
+def _caption_ink_rect_px(full_img, cbb, scale):
+    """Return a tight pixel rect for caption text, ignoring long frame rules."""
+    import numpy as np
+    W, H = full_img.size
+    margin = max(3, round(1.5 * scale))
+    x0 = max(0, round(cbb[0] * scale) - margin)
+    y0 = max(0, round(cbb[1] * scale) - margin)
+    x1 = min(W, round(cbb[2] * scale) + margin)
+    y1 = min(H, round(cbb[3] * scale) + margin)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    gray = np.asarray(full_img.crop((x0, y0, x1, y1)).convert("L"))
+    ink = gray < 235
+    if not ink.any():
+        return (x0, y0, x1, y1)
+
+    h, w = ink.shape
+    long_rows = np.flatnonzero(ink.sum(axis=1) >= 0.50 * w) if w and h else np.array([], dtype=int)
+    long_cols = np.flatnonzero(ink.sum(axis=0) >= 0.50 * h) if w and h else np.array([], dtype=int)
+    if w and h:
+        ink[long_rows, :] = False
+        ink[:, long_cols] = False
+    if not ink.any():
+        return (x0, y0, x1, y1)
+
+    ys, xs = np.nonzero(ink)
+    pad_x, pad_y_top, pad_y_bottom = 5, 4, 2
+    ox0 = max(0, x0 + int(xs.min()) - pad_x)
+    oy0 = max(0, y0 + int(ys.min()) - pad_y_top)
+    ox1 = min(W, x0 + int(xs.max()) + 1 + pad_x)
+    oy1 = min(H, y0 + int(ys.max()) + 1 + pad_y_bottom)
+    right_rules = long_cols[long_cols > xs.max()]
+    bottom_rules = long_rows[long_rows > ys.max()]
+    if right_rules.size:
+        ox1 = min(ox1, x0 + int(right_rules.min()))
+    if bottom_rules.size:
+        oy1 = min(oy1, y0 + int(bottom_rules.min()))
+    return (ox0, oy0, ox1, oy1)
+
+
 def _rect_overlap(a, b):
     return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
 
@@ -892,7 +972,7 @@ def _mask_rect(mask, rect, crop_box, scale, pad=1):
         mask[y0:y1, x0:x1] = True
 
 
-def _trim_ignore_mask(shape, crop_box_px, fig_bb, text_lines, drawing_bbs, scale):
+def _trim_ignore_mask(shape, crop_box_px, fig_bb, text_lines, drawing_bbs, scale, keep_caption_bbs=()):
     """Mask PDF page furniture for trim decisions only; never alters saved pixels."""
     import numpy as np
     H, W = shape
@@ -909,6 +989,9 @@ def _trim_ignore_mask(shape, crop_box_px, fig_bb, text_lines, drawing_bbs, scale
 
     for _txt, rect in text_lines:
         if not CAP_RE.match(_txt):
+            continue
+        if any(_rect_overlap(rect, k) > 0.4 * max(0.1, (rect[2] - rect[0]) * (rect[3] - rect[1]))
+               for k in keep_caption_bbs):
             continue
         if _rect_overlap(rect, crop_pt) <= 0 or not outside_figure(rect):
             continue
@@ -981,12 +1064,23 @@ def _caption_cell_for_region(region_bb, caps, drawing_bbs, page_rect):
     return None if best is None else (best[1], best[2])
 
 
-def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False, trim_mode="mask"):
+def _normalize_caption_mode(mode):
+    mode = str(mode or "exclude").lower().replace("-", "_")
+    if mode in ("exclude", "none", "off", "false", "0", "no_caption", "no_captions"):
+        return "exclude"
+    if mode in ("include", "caption", "captions", "with_caption", "with_captions", "on", "true", "1"):
+        return "include"
+    raise ValueError(f"unknown caption_mode: {mode}")
+
+
+def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False,
+            trim_mode="mask", caption_mode="exclude"):
     """論文PDFから図を切り出す。**既定＝図ごとに一括（全パネル＋間のテキスト込みで1枚）**。
       （既定 None,None,False）… 各 Fig.N を1枚に（所属領域の外接矩形）。番号不明領域は x##。
       panels=True … a/b/c… パネル単位に分割（各領域を個別切出・パネル記号で命名）。
       figs=[1,2]  … その Fig 番号だけ（一括/分割どちらにも効く）。Fig5 始まりページでも実番号で当たる。
       top=2       … 各ページ上から2領域（位置基準・密ページ用フォールバック）。
+      caption_mode="include" … 対応するキャプション行も含めて切り出す。
     番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（PDFテキスト層・MinerU非依存）。"""
     import fitz
     m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
@@ -995,6 +1089,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         trim_mode = "whiteband"
     if trim_mode not in ("mask", "whiteband"):
         raise ValueError(f"unknown trim_mode: {trim_mode}")
+    caption_mode = _normalize_caption_mode(caption_mode)
     os.makedirs(out_dir, exist_ok=True)
     want = set(figs) if figs else None
     doc = fitz.open(pdf_path)
@@ -1019,6 +1114,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         cap_map = {}
         for cbb, _line, cnum in caps:
             cap_map.setdefault(cnum, []).append(cbb)
+        cap_extent_map = _caption_extents(page)
         drawing_bbs = []
         try:
             for dr in page.get_drawings():
@@ -1043,24 +1139,98 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
         cap_gray = [None]                                          # caption実インク位置検出用
 
-        def _crop(bb, fn, cap_bbs=(), **extra):                    # 検出枠→余白&孤立縁トリム→均一マージン
+        def _crop(bb, fn, cap_bbs=(), include_cap_bbs=(), **extra): # 検出枠→余白&孤立縁トリム→均一マージン
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
             full = cpix[1]; W, H = full.size
             m = round(EXPAND_PT * cs)
-            x0, y0, x1, y1 = (round(v * cs) for v in bb)
+            fig_bb = bb
+            keep_caps = tuple(include_cap_bbs) if caption_mode == "include" else ()
+
+            def trimmed_page_rect(base_bb, guard_caps=()):
+                x0, y0, x1, y1 = (round(v * cs) for v in base_bb)
+                left = max(0, x0 - m)
+                top = max(0, y0 - m) if trim_mode == "whiteband" else max(0, y0)
+                right, bottom = min(W, x1 + m), min(H, y1 + m)
+                guard_bottom = _caption_guard_bottom_px(
+                    full, cap_gray, (left, top, right, bottom), fig_bb, guard_caps, cs)
+                if guard_bottom is not None:
+                    bottom = min(H, guard_bottom)
+                sub = full.crop((left, top, right, bottom))
+                import numpy as np
+                gray = np.asarray(sub.convert("L"))
+                ignore = _trim_ignore_mask(sub.size[::-1], (left, top, right, bottom),
+                                           fig_bb, text_lines, drawing_bbs, cs)
+                (tx0, ty0, tx1, ty1), edges = _trim_box(sub, ignore_mask=ignore,
+                                                        return_edges=True, gray=gray)
+                cut_l, cut_t, cut_r, cut_b = edges
+                if trim_mode == "whiteband":
+                    trim_box = (tx0, ty0, tx1, ty1)
+                    tx0, ty0, tx1, ty1 = _white_band_rect(
+                        gray, (x0 - left, y0 - top, x1 - left, y1 - top), trim_box, ignore)
+                    if cut_l:
+                        tx0 = max(tx0, trim_box[0])
+                    if cut_t:
+                        ty0 = max(ty0, trim_box[1])
+                    if cut_r:
+                        tx1 = min(tx1, trim_box[2])
+                    if cut_b:
+                        ty1 = min(ty1, trim_box[3])
+                    (tx0, ty0, tx1, ty1), pushed = _push_rect_past_ignore((tx0, ty0, tx1, ty1), ignore)
+                    cut_l, cut_t, cut_r, cut_b = (
+                        cut_l or pushed[0], cut_t or pushed[1], cut_r or pushed[2], cut_b or pushed[3])
+                if tx0 > 0 and ignore[:, max(0, tx0 - PAD_PX):tx0].any():
+                    cut_l = True
+                if ty0 > 0 and ignore[max(0, ty0 - PAD_PX):ty0, :].any():
+                    cut_t = True
+                if tx1 < sub.width and ignore[:, tx1:min(sub.width, tx1 + PAD_PX)].any():
+                    cut_r = True
+                if ty1 < sub.height and ignore[ty1:min(sub.height, ty1 + PAD_PX), :].any():
+                    cut_b = True
+                sx0 = tx0 if cut_l else max(0, tx0 - PAD_PX)
+                sy0 = ty0 if cut_t else max(0, ty0 - PAD_PX)
+                sx1 = tx1 if cut_r else min(sub.width, tx1 + PAD_PX)
+                sy1 = ty1 if cut_b else min(sub.height, ty1 + PAD_PX)
+                if guard_bottom is not None:
+                    sy1 = sub.height
+                return (left + sx0, top + sy0, left + sx1, top + sy1)
+
+            if keep_caps:
+                fx0, fy0, fx1, fy1 = trimmed_page_rect(fig_bb, cap_bbs)
+                cap_px = None
+                for cbb in keep_caps:
+                    rect = _caption_ink_rect_px(full, cbb, cs)
+                    if rect is None:
+                        continue
+                    cap_px = rect if cap_px is None else (
+                        min(cap_px[0], rect[0]), min(cap_px[1], rect[1]),
+                        max(cap_px[2], rect[2]), max(cap_px[3], rect[3]))
+                if cap_px is not None:
+                    fx0, fy0, fx1, fy1 = (min(fx0, cap_px[0]), min(fy0, cap_px[1]),
+                                          max(fx1, cap_px[2]), max(fy1, cap_px[3]))
+                sub = full.crop((fx0, fy0, fx1, fy1))
+                sub.save(os.path.join(out_dir, fn), quality=90)
+                crop_bb = (fx0 / cs, fy0 / cs, fx1 / cs, fy1 / cs)
+                manifest.append({"file": fn, "page": pno + 1,
+                                 "bbox_pt": [round(x, 1) for x in crop_bb],
+                                 "caption_mode": caption_mode, **extra})
+                return
+
+            crop_bb = bb
+            x0, y0, x1, y1 = (round(v * cs) for v in crop_bb)
             left = max(0, x0 - m)
             top = max(0, y0 - m) if trim_mode == "whiteband" else max(0, y0)
             right, bottom = min(W, x1 + m), min(H, y1 + m)
             guard_bottom = _caption_guard_bottom_px(
-                full, cap_gray, (left, top, right, bottom), bb, cap_bbs, cs)
+                full, cap_gray, (left, top, right, bottom), fig_bb, cap_bbs, cs)
             if guard_bottom is not None:
                 bottom = min(H, guard_bottom)
             sub = full.crop((left, top, right, bottom))
             import numpy as np
             gray = np.asarray(sub.convert("L"))
-            ignore = _trim_ignore_mask(sub.size[::-1], (left, top, right, bottom), bb, text_lines, drawing_bbs, cs)
+            ignore = _trim_ignore_mask(sub.size[::-1], (left, top, right, bottom), fig_bb,
+                                       text_lines, drawing_bbs, cs, keep_caption_bbs=keep_caps)
             (tx0, ty0, tx1, ty1), edges = _trim_box(sub, ignore_mask=ignore, return_edges=True, gray=gray)
             cut_l, cut_t, cut_r, cut_b = edges
             if trim_mode == "whiteband":
@@ -1100,7 +1270,9 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                 canvas.paste(sub, (lp, tp))
                 sub = canvas
             sub.save(os.path.join(out_dir, fn), quality=90)
-            manifest.append({"file": fn, "page": pno + 1, "bbox_pt": [round(x, 1) for x in bb], **extra})
+            manifest.append({"file": fn, "page": pno + 1,
+                             "bbox_pt": [round(x, 1) for x in crop_bb],
+                             "caption_mode": caption_mode, **extra})
 
         if top:                                                    # ── 位置基準（領域ごと）
             for k, d in enumerate(regions[:top], 1):
@@ -1122,6 +1294,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                 tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
                 _crop(region_bbs[i], f"fig_p{pno+1:02d}_{tag}.jpg",
                       cap_bbs=cap_map.get(num, ()) if num is not None else (),
+                      include_cap_bbs=cap_extent_map.get(num, ()) if num is not None else (),
                       fig=(f"Fig{num}" if num is not None else None), label=d["label"])
             continue
         # ── 既定：図ごとに一括（全体）
@@ -1130,7 +1303,9 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
             if want is not None and num not in want:
                 continue
             _crop(wholes[num], f"fig_p{pno+1:02d}_Fig{num}.jpg",
-                  cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}", label="figure")
+                  cap_bbs=cap_map.get(num, ()),
+                  include_cap_bbs=cap_extent_map.get(num, ()),
+                  fig=f"Fig{num}", label="figure")
         if want is None:                                           # 番号に属さない領域は個別フォールバック
             xn = 0
             for i, d in enumerate(regions):
@@ -1180,6 +1355,7 @@ def serve(device="auto", port=None):
         panels: bool = False                    # True＝a/b/c パネル分割（既定 False＝図ごと一括）
 
         trim_mode: str = "mask"                 # mask=fast default, whiteband=local whitespace snap
+        caption_mode: str = "exclude"           # exclude=default, include=include matched caption text
 
     @app.get("/health")
     def health():
@@ -1190,7 +1366,7 @@ def serve(device="auto", port=None):
         import time as _t
         s = _t.perf_counter()
         man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top,
-                      panels=r.panels, trim_mode=r.trim_mode)
+                      panels=r.panels, trim_mode=r.trim_mode, caption_mode=r.caption_mode)
         return {"device": model[1], "elapsed_s": round(_t.perf_counter() - s, 3),
                 "n": len(man), "figures": man}
 
@@ -1207,15 +1383,20 @@ if __name__ == "__main__":
         dev = sys.argv[4] if len(sys.argv) > 4 else "auto"
         figs = None
         trim_mode = "mask"
+        caption_mode = "exclude"
         for arg in sys.argv[5:]:
             if arg.startswith("figs="):
                 figs = [int(x) for x in arg[5:].split(",") if x]
             elif arg.startswith("trim="):
                 trim_mode = arg[5:]
+            elif arg.startswith("caption=") or arg.startswith("captions=") or arg.startswith("caption_mode="):
+                caption_mode = arg.split("=", 1)[1]
             elif arg in ("mask", "whiteband", "white", "white_band", "band"):
                 trim_mode = arg
+            elif arg in ("caption", "captions", "with_caption", "with_captions", "include_caption", "include_captions"):
+                caption_mode = "include"
             else:
                 figs = [int(x) for x in arg.split(",") if x]
-        extract(sys.argv[2], sys.argv[3], dev, figs=figs, trim_mode=trim_mode)
+        extract(sys.argv[2], sys.argv[3], dev, figs=figs, trim_mode=trim_mode, caption_mode=caption_mode)
     else:
         print("usage: 図切り抜き.py serve|extract …  （①手動クロップ関数は主環境で import して使用）")
