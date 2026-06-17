@@ -29,6 +29,7 @@ EXPAND_PT = 3.0                                  # 検出枠の数px内入りを
 PAD_PX = 6                                       # 余白トリム後に残す均一マージン(px)。0で完全タイト
 TRIM_THRESH = 12                                # 余白トリムの白判定しきい値（これ未満の濃さ＝白＝余白）
 EDGE_LINE_FRAC = 0.60                           # 隣図の枠線扱いする最小投影長（文字ストローク誤削除を避ける）
+WHITE_BAND_PX = 5                               # Crop edge is snapped to a local white strip around the detector bbox.
 CAP_RE = re.compile(r"(?i)^\s*(fig(?:ure)?|table)\.?\s*(\d+)")   # 「Fig 3」始まりのみ＝本文/見出し誤検出を排除
 # PP-DocLayoutV2 のクラス（label_id→名前。OpenVINO版の後処理で使用）
 PP_LABELS = ["abstract", "algorithm", "aside_text", "chart", "content", "display_formula",
@@ -497,7 +498,7 @@ def _bool_run_bounds(mask, offset=0):
     return runs
 
 
-def _trim_box(img, ignore_mask=None, return_edges=False):
+def _trim_box(img, ignore_mask=None, return_edges=False, gray=None):
     """Return the content box, trimming white margin and detached neighbor-frame lines.
 
     The ordinary white trim uses the ink projection. A second pass only peels off
@@ -505,7 +506,7 @@ def _trim_box(img, ignore_mask=None, return_edges=False):
     borders, axes, and edge labels stay intact.
     """
     import numpy as np
-    gray = np.asarray(img.convert("L"))
+    gray = np.asarray(img.convert("L")) if gray is None else gray
     H, W = gray.shape
     ink = gray < (255 - TRIM_THRESH)
     dark = gray < 80
@@ -672,6 +673,12 @@ def _trim_box(img, ignore_mask=None, return_edges=False):
         if snapped:
             hi = nhi
             cut_hi = True
+        dark_counts = axis_dark_counts(axis)
+        pale_full = max(2, int(0.08 * span))
+        while cut_lo and lo < hi - 1 and counts[lo] >= EDGE_LINE_FRAC * span and dark_counts[lo] <= pale_full:
+            lo += 1
+        while cut_hi and hi > lo + 1 and counts[hi - 1] >= EDGE_LINE_FRAC * span and dark_counts[hi - 1] <= pale_full:
+            hi -= 1
         return lo, hi, cut_lo, cut_hi
 
     x0, x1, cut_l, cut_r = trim_axis(colc, "x")
@@ -683,6 +690,148 @@ def _trim_box(img, ignore_mask=None, return_edges=False):
         box = (x0, y0, x1, y1)
         edges = (cut_l, cut_t, cut_r, cut_b)
     return (box, edges) if return_edges else box
+
+
+def _white_band_rect(gray, base_box, content_box, ignore_mask=None):
+    """Snap crop edges to local white bands around the detector bbox.
+
+    The search starts from the original detector edges and only looks nearby.
+    It never moves inside the visible content box produced by _trim_box, so a
+    clean internal gap cannot clip axes, table borders, or labels.
+    """
+    import numpy as np
+    H, W = gray.shape
+    if W < 4 or H < 4:
+        return content_box
+
+    ignore = None
+    if ignore_mask is not None:
+        ignore = np.asarray(ignore_mask, dtype=bool)
+        if ignore.shape != gray.shape:
+            ignore = None
+
+    dark = gray < 90
+    ink = gray < 245
+    if ignore is not None:
+        dark &= ~ignore
+        ink &= ~ignore
+    dark_sat = np.pad(dark.astype(np.int32).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    ink_sat = np.pad(ink.astype(np.int32).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, int(round(v))))
+
+    bx0, by0, bx1, by1 = base_box
+    cx0, cy0, cx1, cy1 = content_box
+    bx0, bx1 = clamp(bx0, 0, W), clamp(bx1, 0, W)
+    by0, by1 = clamp(by0, 0, H), clamp(by1, 0, H)
+    cx0, cx1 = clamp(cx0, 0, W), clamp(cx1, 0, W)
+    cy0, cy1 = clamp(cy0, 0, H), clamp(cy1, 0, H)
+    if cx1 - cx0 < 4 or cy1 - cy0 < 4:
+        return content_box
+
+    band = max(3, WHITE_BAND_PX)
+    search_x = min(W, max(PAD_PX * 6, band * 4, int(W * 0.04)))
+    search_y = min(H, max(PAD_PX * 6, band * 4, int(H * 0.04)))
+
+    def edge_limits(side):
+        if side == "left":
+            return max(0, bx0 - search_x), min(W, bx0 + search_x), bx0, search_x
+        if side == "right":
+            return max(0, bx1 - search_x), min(W, bx1 + search_x), bx1, search_x
+        if side == "top":
+            return max(0, by0 - search_y), min(H, by0 + search_y), by0, search_y
+        return max(0, by1 - search_y), min(H, by1 + search_y), by1, search_y
+
+    def band_score(side, pos, span0, span1, base):
+        if side in ("top", "bottom"):
+            x0 = clamp(span0, 0, W - 1)
+            x1 = clamp(span1, x0 + 1, W)
+            y0, y1 = (pos, min(H, pos + band)) if side == "top" else (max(0, pos - band), pos)
+        else:
+            y0 = clamp(span0, 0, H - 1)
+            y1 = clamp(span1, y0 + 1, H)
+            x0, x1 = (pos, min(W, pos + band)) if side == "left" else (max(0, pos - band), pos)
+        if x1 <= x0 or y1 <= y0:
+            return (10**9, 10**9, 10**9, 10**9, 10**9, 10**9)
+
+        area = max(1, (y1 - y0) * (x1 - x0))
+        dark_n = int(dark_sat[y1, x1] - dark_sat[y0, x1] - dark_sat[y1, x0] + dark_sat[y0, x0])
+        ink_n = int(ink_sat[y1, x1] - ink_sat[y0, x1] - ink_sat[y1, x0] + ink_sat[y0, x0])
+        dark_rate = int(10000 * dark_n / area)
+        ink_rate = int(10000 * ink_n / area)
+        if side in ("left", "top"):
+            inward = max(0, pos - base)
+            outward_tie = pos
+        else:
+            inward = max(0, base - pos)
+            outward_tie = -pos
+        dist_bucket = abs(pos - base) // band
+        return (dark_n, dark_rate, ink_n, ink_rate, dist_bucket, inward, outward_tie)
+
+    def pick(side, span0, span1):
+        lo, hi, base, _search = edge_limits(side)
+        lo, hi = int(lo), int(hi)
+        if hi < lo:
+            return base
+        return min(range(lo, hi + 1), key=lambda p: band_score(side, p, span0, span1, base))
+
+    x0 = pick("left", cy0, cy1)
+    x1 = pick("right", cy0, cy1)
+    if x1 - x0 < 4:
+        x0, x1 = cx0, cx1
+    y0 = pick("top", x0, x1)
+    y1 = pick("bottom", x0, x1)
+    if y1 - y0 < 4:
+        y0, y1 = cy0, cy1
+    x0 = pick("left", y0, y1)
+    x1 = pick("right", y0, y1)
+
+    # Preserve all visible content detected by the ordinary trim pass.
+    x0, y0 = min(x0, cx0), min(y0, cy0)
+    x1, y1 = max(x1, cx1), max(y1, cy1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return content_box
+    return (x0, y0, x1, y1)
+
+
+def _push_rect_past_ignore(box, ignore_mask):
+    """Move crop edges out of ignored strips so masked furniture is not rendered."""
+    import numpy as np
+    if ignore_mask is None:
+        return box, (False, False, False, False)
+    ignore = np.asarray(ignore_mask, dtype=bool)
+    if ignore.ndim != 2:
+        return box, (False, False, False, False)
+    H, W = ignore.shape
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0, x1 = max(0, min(W, x0)), max(0, min(W, x1))
+    y0, y1 = max(0, min(H, y0)), max(0, min(H, y1))
+    cut_l = cut_t = cut_r = cut_b = False
+
+    def row_ignored(y):
+        span = max(1, x1 - x0)
+        return int(ignore[y, x0:x1].sum()) >= 0.50 * span
+
+    def col_ignored(x):
+        span = max(1, y1 - y0)
+        return int(ignore[y0:y1, x].sum()) >= 0.50 * span
+
+    while y0 < y1 - 1 and row_ignored(y0):
+        y0 += 1
+        cut_t = True
+    while y1 > y0 + 1 and row_ignored(y1 - 1):
+        y1 -= 1
+        cut_b = True
+    while x0 < x1 - 1 and col_ignored(x0):
+        x0 += 1
+        cut_l = True
+    while x1 > x0 + 1 and col_ignored(x1 - 1):
+        x1 -= 1
+        cut_r = True
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return box, (False, False, False, False)
+    return (x0, y0, x1, y1), (cut_l, cut_t, cut_r, cut_b)
 
 
 def _caption_gap_bottom_px(gray, left, right, height, cbb, scale):
@@ -800,7 +949,39 @@ def _whole_figures(region_bbs, assign):
     return out
 
 
-def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False):
+def _caption_cell_for_region(region_bb, caps, drawing_bbs, page_rect):
+    """Return a slide/poster cell above a caption inside a giant detector region."""
+    rx0, ry0, rx1, ry1 = region_bb
+    page_area = max(1.0, page_rect.width * page_rect.height)
+    best = None
+    for cbb, _line, num in caps:
+        cx0, cy0, cx1, _cy1 = cbb
+        ccx = (cx0 + cx1) / 2.0
+        if not (rx0 <= ccx <= rx1 and ry0 <= cy0 <= ry1):
+            continue
+        for rect, fill, _color, _width in drawing_bbs:
+            x0, y0, x1, y1 = rect
+            w, h = x1 - x0, y1 - y0
+            if w <= 20 or h <= 20:
+                continue
+            area = w * h
+            if area < 0.04 * page_area or area > 0.40 * page_area:
+                continue
+            if w > 0.75 * page_rect.width or h > 0.55 * page_rect.height:
+                continue
+            if fill is None or min(fill[:3]) < 0.97:
+                continue
+            if min(cx1, x1) - max(cx0, x0) <= 0:
+                continue
+            gap = cy0 - y1
+            if -2.0 <= gap <= 28.0 and y0 < cy0:
+                score = (abs(gap), abs(ccx - (x0 + x1) / 2.0))
+                if best is None or score < best[0]:
+                    best = (score, (x0, y0, x1, y1), num)
+    return None if best is None else (best[1], best[2])
+
+
+def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, panels=False, trim_mode="mask"):
     """論文PDFから図を切り出す。**既定＝図ごとに一括（全パネル＋間のテキスト込みで1枚）**。
       （既定 None,None,False）… 各 Fig.N を1枚に（所属領域の外接矩形）。番号不明領域は x##。
       panels=True … a/b/c… パネル単位に分割（各領域を個別切出・パネル記号で命名）。
@@ -809,6 +990,11 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
     番号は「同カラム直下の最寄りキャプションの Fig.N」を各領域へ割当（PDFテキスト層・MinerU非依存）。"""
     import fitz
     m, dev = model if model is not None else _engine(device)       # model=(m,dev) を渡せば常駐再利用
+    trim_mode = (trim_mode or "mask").lower()
+    if trim_mode in ("white", "white_band", "band"):
+        trim_mode = "whiteband"
+    if trim_mode not in ("mask", "whiteband"):
+        raise ValueError(f"unknown trim_mode: {trim_mode}")
     os.makedirs(out_dir, exist_ok=True)
     want = set(figs) if figs else None
     doc = fitz.open(pdf_path)
@@ -842,6 +1028,18 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                                         dr.get("fill"), dr.get("color"), dr.get("width")))
         except Exception:
             pass
+        page_area = max(1.0, page.rect.width * page.rect.height)
+        for i, bb in enumerate(region_bbs):
+            if i in assign:
+                continue
+            area = max(1.0, (bb[2] - bb[0]) * (bb[3] - bb[1]))
+            if area < 0.45 * page_area:
+                continue
+            clipped = _caption_cell_for_region(bb, caps, drawing_bbs, page.rect)
+            if clipped is None:
+                continue
+            region_bbs[i], num = clipped
+            assign[i] = num
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
         cap_gray = [None]                                          # caption実インク位置検出用
 
@@ -852,16 +1050,34 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
             full = cpix[1]; W, H = full.size
             m = round(EXPAND_PT * cs)
             x0, y0, x1, y1 = (round(v * cs) for v in bb)
-            left, top = max(0, x0 - m), max(0, y0)
+            left = max(0, x0 - m)
+            top = max(0, y0 - m) if trim_mode == "whiteband" else max(0, y0)
             right, bottom = min(W, x1 + m), min(H, y1 + m)
             guard_bottom = _caption_guard_bottom_px(
                 full, cap_gray, (left, top, right, bottom), bb, cap_bbs, cs)
             if guard_bottom is not None:
                 bottom = min(H, guard_bottom)
             sub = full.crop((left, top, right, bottom))
+            import numpy as np
+            gray = np.asarray(sub.convert("L"))
             ignore = _trim_ignore_mask(sub.size[::-1], (left, top, right, bottom), bb, text_lines, drawing_bbs, cs)
-            (tx0, ty0, tx1, ty1), edges = _trim_box(sub, ignore_mask=ignore, return_edges=True)
+            (tx0, ty0, tx1, ty1), edges = _trim_box(sub, ignore_mask=ignore, return_edges=True, gray=gray)
             cut_l, cut_t, cut_r, cut_b = edges
+            if trim_mode == "whiteband":
+                trim_box = (tx0, ty0, tx1, ty1)
+                tx0, ty0, tx1, ty1 = _white_band_rect(
+                    gray, (x0 - left, y0 - top, x1 - left, y1 - top), trim_box, ignore)
+                if cut_l:
+                    tx0 = max(tx0, trim_box[0])
+                if cut_t:
+                    ty0 = max(ty0, trim_box[1])
+                if cut_r:
+                    tx1 = min(tx1, trim_box[2])
+                if cut_b:
+                    ty1 = min(ty1, trim_box[3])
+                (tx0, ty0, tx1, ty1), pushed = _push_rect_past_ignore((tx0, ty0, tx1, ty1), ignore)
+                cut_l, cut_t, cut_r, cut_b = (
+                    cut_l or pushed[0], cut_t or pushed[1], cut_r or pushed[2], cut_b or pushed[3])
             if tx0 > 0 and ignore[:, max(0, tx0 - PAD_PX):tx0].any():
                 cut_l = True
             if ty0 > 0 and ignore[max(0, ty0 - PAD_PX):ty0, :].any():
@@ -963,6 +1179,8 @@ def serve(device="auto", port=None):
         top: int | None = None                  # 例 2＝各ページ上から2図（位置基準・密ページ用）
         panels: bool = False                    # True＝a/b/c パネル分割（既定 False＝図ごと一括）
 
+        trim_mode: str = "mask"                 # mask=fast default, whiteband=local whitespace snap
+
     @app.get("/health")
     def health():
         return {"status": "ok", "device": model[1]}
@@ -971,7 +1189,8 @@ def serve(device="auto", port=None):
     def _extract(r: Req):
         import time as _t
         s = _t.perf_counter()
-        man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top, panels=r.panels)
+        man = extract(r.pdf, r.out_dir, model=model, figs=r.figs, top=r.top,
+                      panels=r.panels, trim_mode=r.trim_mode)
         return {"device": model[1], "elapsed_s": round(_t.perf_counter() - s, 3),
                 "n": len(man), "figures": man}
 
@@ -986,7 +1205,17 @@ if __name__ == "__main__":
         if len(sys.argv) < 4:
             print("usage: 図切り抜き.py extract <pdf> <out_dir> [auto|xpu|cpu] [figs=1,2]"); sys.exit(1)
         dev = sys.argv[4] if len(sys.argv) > 4 else "auto"
-        figs = [int(x) for x in sys.argv[5].split(",")] if len(sys.argv) > 5 else None
-        extract(sys.argv[2], sys.argv[3], dev, figs=figs)
+        figs = None
+        trim_mode = "mask"
+        for arg in sys.argv[5:]:
+            if arg.startswith("figs="):
+                figs = [int(x) for x in arg[5:].split(",") if x]
+            elif arg.startswith("trim="):
+                trim_mode = arg[5:]
+            elif arg in ("mask", "whiteband", "white", "white_band", "band"):
+                trim_mode = arg
+            else:
+                figs = [int(x) for x in arg.split(",") if x]
+        extract(sys.argv[2], sys.argv[3], dev, figs=figs, trim_mode=trim_mode)
     else:
         print("usage: 図切り抜き.py serve|extract …  （①手動クロップ関数は主環境で import して使用）")
