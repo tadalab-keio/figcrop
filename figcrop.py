@@ -1132,9 +1132,9 @@ def _subpanel_boxes(fig_bb, plabels, gray=None, scale=1.0):
 
 def _valid_panel_label_set(labels):
     labs = sorted({lab for lab in labels})
-    if len(labs) < 2 or labs[0] != "a":
+    if len(labs) < 2:
         return False
-    expected = [chr(ord("a") + i) for i in range(len(labs))]
+    expected = [chr(ord(labs[0]) + i) for i in range(len(labs))]
     return labs == expected
 
 
@@ -1271,12 +1271,13 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
         cpix = [None, None]                                        # [pixmap, PIL] 遅延描画用
         cap_gray = [None]                                          # caption実インク位置検出用
 
-        def _crop(bb, fn, cap_bbs=(), include_cap_bbs=(), **extra): # 検出枠→余白&孤立縁トリム→均一マージン
+        def _crop(bb, fn, cap_bbs=(), include_cap_bbs=(), panel_crop=False, **extra): # 検出枠→余白&孤立縁トリム→均一マージン
             if cpix[0] is None:
                 cpix[0] = page.get_pixmap(dpi=CROP_DPI)
                 cpix[1] = Image.frombytes("RGB", (cpix[0].width, cpix[0].height), cpix[0].samples)
             full = cpix[1]; W, H = full.size
-            m = round(EXPAND_PT * cs)
+            m = 0 if panel_crop else round(EXPAND_PT * cs)
+            pad_px = 2 if panel_crop else PAD_PX
             fig_bb = bb
             keep_caps = tuple(include_cap_bbs) if caption_mode == "include" else ()
 
@@ -1380,22 +1381,26 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                 (tx0, ty0, tx1, ty1), pushed = _push_rect_past_ignore((tx0, ty0, tx1, ty1), ignore)
                 cut_l, cut_t, cut_r, cut_b = (
                     cut_l or pushed[0], cut_t or pushed[1], cut_r or pushed[2], cut_b or pushed[3])
-            if tx0 > 0 and ignore[:, max(0, tx0 - PAD_PX):tx0].any():
+            if tx0 > 0 and ignore[:, max(0, tx0 - pad_px):tx0].any():
                 cut_l = True
-            if ty0 > 0 and ignore[max(0, ty0 - PAD_PX):ty0, :].any():
+            if ty0 > 0 and ignore[max(0, ty0 - pad_px):ty0, :].any():
                 cut_t = True
-            if tx1 < sub.width and ignore[:, tx1:min(sub.width, tx1 + PAD_PX)].any():
+            if tx1 < sub.width and ignore[:, tx1:min(sub.width, tx1 + pad_px)].any():
                 cut_r = True
-            if ty1 < sub.height and ignore[ty1:min(sub.height, ty1 + PAD_PX), :].any():
+            if ty1 < sub.height and ignore[ty1:min(sub.height, ty1 + pad_px), :].any():
                 cut_b = True
-            sx0 = tx0 if cut_l else max(0, tx0 - PAD_PX)
-            sy0 = ty0 if cut_t else max(0, ty0 - PAD_PX)
-            sx1 = tx1 if cut_r else min(sub.width, tx1 + PAD_PX)
-            sy1 = ty1 if cut_b else min(sub.height, ty1 + PAD_PX)
+            sx0 = tx0 if cut_l else max(0, tx0 - pad_px)
+            sy0 = ty0 if cut_t else max(0, ty0 - pad_px)
+            sx1 = tx1 if cut_r else min(sub.width, tx1 + pad_px)
+            sy1 = ty1 if cut_b else min(sub.height, ty1 + pad_px)
+            if cut_b and cap_bbs and guard_bottom is None and not panel_crop:
+                sy1 = min(sub.height, ty1 + pad_px)
             if guard_bottom is not None:
                 sy1 = sub.height                              # キャプション直前までの白い隙間は保持
-            lp, tp = max(0, PAD_PX - (tx0 - sx0)), max(0, PAD_PX - (ty0 - sy0))
-            rp, bp = max(0, PAD_PX - (sx1 - tx1)), max(0, PAD_PX - (sy1 - ty1))
+            lp, tp = max(0, pad_px - (tx0 - sx0)), max(0, pad_px - (ty0 - sy0))
+            rp, bp = max(0, pad_px - (sx1 - tx1)), max(0, pad_px - (sy1 - ty1))
+            if not panel_crop:
+                bp = max(bp, PAD_PX)
             sub = sub.crop((sx0, sy0, sx1, sy1))
             if lp or tp or rp or bp:
                 canvas = Image.new(sub.mode, (sub.width + lp + rp, sub.height + tp + bp), "white")
@@ -1405,6 +1410,118 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
             manifest.append({"file": fn, "page": pno + 1,
                              "bbox_pt": [round(x, 1) for x in crop_bb],
                              "caption_mode": caption_mode, **extra})
+
+        def _refined_panel_boxes(num, fig_bb):
+            fx0, fy0, fx1, fy1 = fig_bb
+            fw, fh = max(1.0, fx1 - fx0), max(1.0, fy1 - fy0)
+            labels = []
+            for lbb, lab in plabels:
+                cx, cy = (lbb[0] + lbb[2]) / 2.0, (lbb[1] + lbb[3]) / 2.0
+                if fx0 - 8 <= cx <= fx1 + 8 and fy0 - 8 <= cy <= fy1 + 8:
+                    labels.append((lbb, lab, cx, cy))
+            if len({lab for _bb, lab, _cx, _cy in labels}) < 2:
+                return []
+
+            ds = DET_DPI / 72.0
+            ix0, iy0 = max(0, round(fx0 * ds)), max(0, round(fy0 * ds))
+            ix1, iy1 = min(img.width, round(fx1 * ds)), min(img.height, round(fy1 * ds))
+            if ix1 - ix0 < 20 or iy1 - iy0 < 20:
+                return []
+            fig_img = img.crop((ix0, iy0, ix1, iy1))
+            try:
+                local_preds = m.predict(fig_img)
+            except Exception:
+                return []
+
+            local_bbs = []
+            fig_area = fw * fh
+            for pred in local_preds:
+                if pred["label"] not in FIG_LABELS:
+                    continue
+                x0, y0, x1, y1 = pred["bbox"]
+                bb = (fx0 + x0 / ds, fy0 + y0 / ds, fx0 + x1 / ds, fy0 + y1 / ds)
+                bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+                if bw < 8.0 or bh < 8.0 or bw * bh < 0.006 * fig_area:
+                    continue
+                local_bbs.append((bb, pred["label"]))
+            if len(local_bbs) < 2:
+                return []
+
+            label_by_panel = {}
+            for lbb, lab, cx, cy in labels:
+                cur = label_by_panel.get(lab)
+                if cur is None or (cy, cx) < ((cur[0][1] + cur[0][3]) / 2.0, (cur[0][0] + cur[0][2]) / 2.0):
+                    label_by_panel[lab] = (lbb, cx, cy)
+
+            row_tol = max(6.0, min(18.0, 0.08 * fh))
+            col_tol = max(6.0, min(18.0, 0.08 * fw))
+
+            def trim_near_neighbor_labels(bb, lab):
+                """Keep a refined detector box from swallowing adjacent panel labels."""
+                own = label_by_panel.get(lab)
+                if own is None:
+                    return bb
+                _, own_cx, own_cy = own
+                x0, y0, x1, y1 = bb
+                for other_bb, other_lab, ocx, ocy in labels:
+                    if other_lab == lab:
+                        continue
+                    ox0, oy0, ox1, oy1 = other_bb
+                    same_row = abs(ocy - own_cy) <= row_tol
+                    same_col = abs(ocx - own_cx) <= col_tol
+                    if same_row and x0 < ox0 < x1 and ocx > own_cx:
+                        x1 = min(x1, ox0 - 0.8)
+                    if same_row and x0 < ox1 < x1 and ocx < own_cx:
+                        x0 = max(x0, ox1 + 0.8)
+                    if same_col and y0 < oy0 < y1 and ocy > own_cy:
+                        y1 = min(y1, oy0 - 0.8)
+                    if same_col and y0 < oy1 < y1 and ocy < own_cy:
+                        y0 = max(y0, oy1 + 0.8)
+                if x1 - x0 < 8.0 or y1 - y0 < 8.0:
+                    return bb
+                return (x0, y0, x1, y1)
+
+            def assign_label(rbb):
+                rx0, ry0, rx1, ry1 = rbb
+                margin = max(5.0, 0.04 * min(fw, fh))
+                direct = []
+                for lbb, lab, cx, cy in labels:
+                    if rx0 - margin <= cx <= rx1 + margin and ry0 - margin <= cy <= ry1 + margin:
+                        direct.append((abs(cx - rx0) + abs(cy - ry0), lab))
+                if direct:
+                    return min(direct)[1]
+                near = []
+                rcx = (rx0 + rx1) / 2.0
+                for lbb, lab, cx, cy in labels:
+                    x_margin = max(6.0, 0.04 * fw)
+                    x_ok = rx0 - x_margin <= cx <= rx1 + x_margin
+                    y_ok = cy <= ry1 + margin
+                    if x_ok and y_ok:
+                        dy = max(0.0, ry0 - cy)
+                        dx = 0.0 if rx0 <= cx <= rx1 else min(abs(cx - rx0), abs(cx - rx1))
+                        center_dx = abs(cx - rcx)
+                        near.append((dy + dx + 6.0 * center_dx, lab))
+                return min(near)[1] if near else None
+
+            groups = {}
+            labels_for_group = {}
+            for bb, local_label in local_bbs:
+                lab = assign_label(bb)
+                if not lab:
+                    continue
+                bb = trim_near_neighbor_labels(bb, lab)
+                if lab in label_by_panel:
+                    lbb = label_by_panel[lab][0]
+                    bb = _union(bb, (lbb[0] - 1.0, lbb[1] - 0.5, lbb[2] + 1.0, lbb[3] + 0.5))
+                groups[lab] = bb if lab not in groups else _union(groups[lab], bb)
+                labels_for_group.setdefault(lab, local_label)
+            if len(groups) < 2:
+                return []
+            labs = sorted(groups)
+            expected = [chr(ord(labs[0]) + i) for i in range(len(labs))]
+            if labs != expected:
+                return []
+            return [(lab, groups[lab], labels_for_group.get(lab, "panel")) for lab in labs]
 
         if top:                                                    # ── 位置基準（領域ごと）
             for k, d in enumerate(regions[:top], 1):
@@ -1424,6 +1541,13 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                                     if wholes[num][0] - 8 <= (bb[0] + bb[2]) / 2.0 <= wholes[num][2] + 8
                                     and wholes[num][1] - 8 <= (bb[1] + bb[3]) / 2.0 <= wholes[num][3] + 8]
                 if not _valid_panel_label_set(fig_panel_labels):
+                    continue
+                refined = _refined_panel_boxes(num, wholes[num]) if len(set(fig_panel_labels)) >= 3 else []
+                if refined:
+                    for panel, pbb, label in refined:
+                        _crop(pbb, f"fig_p{pno+1:02d}_Fig{num}_{panel}.jpg",
+                              cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
+                              label=label, panel=panel, mode=output_mode, panel_crop=True)
                     continue
                 panel_bounds = {panel: pbb for panel, pbb, _label_bb in
                                 _subpanel_boxes(wholes[num], plabels, det_gray, DET_DPI / 72.0)}
@@ -1453,7 +1577,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                         tag = base + (f"-{seen[base]}" if seen[base] > 1 else "")
                         _crop(pbb, f"fig_p{pno+1:02d}_{tag}.jpg",
                               cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
-                              label=label, panel=panel, mode=output_mode)
+                              label=label, panel=panel, mode=output_mode, panel_crop=True)
                     continue
 
                 boxes = _subpanel_boxes(wholes[num], plabels, det_gray, DET_DPI / 72.0)
@@ -1461,7 +1585,7 @@ def extract(pdf_path, out_dir, device="auto", model=None, figs=None, top=None, p
                     for panel, pbb, _label_bb in boxes:
                         _crop(pbb, f"fig_p{pno+1:02d}_Fig{num}_{panel}.jpg",
                               cap_bbs=cap_map.get(num, ()), fig=f"Fig{num}",
-                              label="panel", panel=panel, mode=output_mode)
+                              label="panel", panel=panel, mode=output_mode, panel_crop=True)
                     continue
             continue
         # ── 既定：図ごとに一括（全体）
@@ -1513,7 +1637,7 @@ def serve(device="auto", port=None):
     print(f"[fig-server] ready on {model[1]} in {time.perf_counter()-t:.1f}s", flush=True)
     app = FastAPI(
         title="figcrop",
-        version="0.2.1",
+        version="0.2.2",
         description=(
             "Extract publication figures/tables from PDFs by real Fig.N/Table N "
             "captions. Outputs JPEG crops plus a figures.json manifest."

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "figcrop"
-version = "0.2.1"
+version = "0.2.2"
 description = "High-quality figure extraction from dense research-paper PDFs"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -47,4 +47,4 @@ figcrop = "figcrop:main"
 figcrop-mcp = "figcrop_mcp:main"
 
 [tool.setuptools]
-py-modules = ["figcrop", "figtools", "figcrop_mcp"]
+py-modules = ["figcrop", "figcrop_mcp"]
